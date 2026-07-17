@@ -1,11 +1,13 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
 import { Buffer } from "node:buffer";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { VERSION } from "@gajae-code/coding-agent";
 import type { Args } from "@gajae-code/coding-agent/cli/args";
 import {
+	__setComputerBrokerStarterForTests,
 	applyGjcTmuxProfile,
 	buildDefaultTmuxLaunchPlan,
 	buildGjcTmuxProfileCommands,
@@ -65,6 +67,7 @@ function safeAbsentOwnerIsolationProbe(): NonNullable<TmuxLaunchContext["ownerIs
 function launchContext(context: TmuxLaunchContext): TmuxLaunchContext {
 	return {
 		platform: "linux",
+		architecture: "x64",
 		ownerIsolationProbe: safeAbsentOwnerIsolationProbe(),
 		...context,
 		env: {
@@ -141,6 +144,7 @@ const originalStderrWrite = process.stderr.write.bind(process.stderr);
 
 afterEach(() => {
 	process.exitCode = undefined;
+	__setComputerBrokerStarterForTests(null);
 });
 
 function stderrError(code: string): Error {
@@ -3113,7 +3117,7 @@ describe("tmux owner isolation launch gate", () => {
 		}
 	});
 
-	it("starts one macOS arm64 broker, preserves its lease, and injects its environment into the managed owner", () => {
+	it("starts one macOS arm64 broker with a custom tmux spawner, preserves its lease, and injects its environment into the managed owner", () => {
 		const calls: string[][] = [];
 		const dispose = vi.fn();
 		const start = vi.fn(() => ({
@@ -3145,6 +3149,34 @@ describe("tmux owner isolation launch gate", () => {
 		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_SOCKET='/tmp/broker.sock'");
 		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_TOKEN='secret'");
 		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_REQUIRED='1'");
+	});
+
+	it("does not let a custom tmux spawner suppress the default macOS arm64 broker requirement", () => {
+		const calls: string[][] = [];
+		const defaultStart = vi.fn(() => null);
+		__setComputerBrokerStarterForTests(defaultStart);
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello"], tmux: true }),
+			rawArgs: ["--tmux", "hello"],
+			cwd: launchTestRoot,
+			env: {},
+			argv: ["bun", "cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			architecture: "arm64",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: null,
+			spawnSync: (_command, spawnArgs) => {
+				calls.push(spawnArgs);
+				return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+			},
+		});
+		expect(handled).toBe(true);
+		expect(defaultStart).toHaveBeenCalledTimes(1);
+		const innerCommand = calls.find(call => call[0] === "new-session")?.at(-1);
+		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_REQUIRED='1'");
+		expect(innerCommand).not.toContain("GJC_COMPUTER_BROKER_SOCKET=");
 	});
 
 	it("does not start the broker for existing attaches, unsupported platforms, unsupported architectures, or direct launch", () => {
@@ -3185,6 +3217,13 @@ describe("tmux owner isolation launch gate", () => {
 		});
 		launchDefaultTmuxIfNeeded({
 			...base,
+			env: { TMUX: "/tmp/tmux" },
+			platform: "darwin",
+			architecture: "arm64",
+			existingBranchSessionName: null,
+		});
+		launchDefaultTmuxIfNeeded({
+			...base,
 			env: { GJC_LAUNCH_POLICY: "direct" },
 			platform: "darwin",
 			architecture: "arm64",
@@ -3193,8 +3232,12 @@ describe("tmux owner isolation launch gate", () => {
 		expect(start).not.toHaveBeenCalled();
 	});
 
-	it("marks managed tmux computer use unavailable when the broker cannot start", () => {
+	it("marks managed tmux computer use unavailable when the broker starter throws", () => {
 		const calls: string[][] = [];
+		const diagnostics: string[] = [];
+		const start = vi.fn(() => {
+			throw new Error("broker credential: secret");
+		});
 		const handled = launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello"], tmux: true }),
 			rawArgs: ["--tmux", "hello"],
@@ -3207,14 +3250,16 @@ describe("tmux owner isolation launch gate", () => {
 			tty: interactiveTty,
 			tmuxAvailable: true,
 			existingBranchSessionName: null,
-			computerBrokerStarter: () => null,
+			computerBrokerStarter: start,
+			diagnosticWriter: message => diagnostics.push(message),
 			spawnSync: (_command, spawnArgs) => {
 				calls.push(spawnArgs);
 				return { exitCode: 0, stdout: NATIVE_SESSION_ID };
 			},
 		});
 		expect(handled).toBe(true);
-		expect(calls.some(call => call[0] === "new-session")).toBe(true);
+		expect(start).toHaveBeenCalledTimes(1);
+		expect(diagnostics.join("\n")).toContain("macOS computer broker unavailable");
 		const innerCommand = calls.find(call => call[0] === "new-session")?.at(-1);
 		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_REQUIRED='1'");
 		expect(innerCommand).not.toContain("GJC_COMPUTER_BROKER_SOCKET");
@@ -3264,8 +3309,11 @@ describe("tmux owner isolation launch gate", () => {
 		expect(events.indexOf("broker")).toBeLessThan(events.indexOf("new-session"));
 	});
 
-	it("disposes a macOS broker when tmux creation fails before preserving an inner process", () => {
-		const dispose = vi.fn();
+	it("preserves new-session failure evidence when macOS broker cleanup throws", () => {
+		const diagnostics: string[] = [];
+		const dispose = vi.fn(() => {
+			throw new Error("broker credential: secret");
+		});
 		const handled = launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello"], tmux: true }),
 			rawArgs: ["--tmux", "hello"],
@@ -3278,11 +3326,47 @@ describe("tmux owner isolation launch gate", () => {
 			tty: interactiveTty,
 			tmuxAvailable: true,
 			existingBranchSessionName: null,
+			diagnosticWriter: message => diagnostics.push(message),
 			computerBrokerStarter: () => ({ environment: { GJC_COMPUTER_BROKER_TOKEN: "secret" }, dispose }),
 			spawnSync: () => ({ exitCode: 1, stderr: "creation refused" }),
 		});
 		expect(handled).toBe(true);
 		expect(dispose).toHaveBeenCalledTimes(1);
+		expect(diagnostics.join("\n")).toContain("new-session failed");
+		expect(diagnostics.join("\n")).toContain("macOS computer broker cleanup failed");
+		expect(diagnostics.join("\n")).not.toContain("broker credential");
+	});
+
+	it("preserves owner lifecycle failure evidence when macOS broker cleanup throws", () => {
+		const diagnostics: string[] = [];
+		const dispose = vi.fn(() => {
+			throw new Error("broker credential: secret");
+		});
+		spyOn(crypto, "randomUUID").mockImplementation(() => {
+			throw new Error("owner lifecycle secret");
+		});
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello"], tmux: true }),
+			rawArgs: ["--tmux", "hello"],
+			cwd: launchTestRoot,
+			env: {},
+			argv: ["bun", "cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			architecture: "arm64",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: null,
+			diagnosticWriter: message => diagnostics.push(message),
+			computerBrokerStarter: () => ({ environment: {}, dispose }),
+			spawnSync: () => ({ exitCode: 0, stdout: NATIVE_SESSION_ID }),
+		});
+		expect(handled).toBe(true);
+		expect(dispose).toHaveBeenCalledTimes(1);
+		expect(diagnostics.join("\n")).toContain("tmux owner lifecycle publication failed");
+		expect(diagnostics.join("\n")).toContain("macOS computer broker cleanup failed");
+		expect(diagnostics.join("\n")).not.toContain("owner lifecycle secret");
+		expect(diagnostics.join("\n")).not.toContain("broker credential");
 	});
 
 	it("persists a fail-closed portable owner terminal verdict on Darwin", async () => {

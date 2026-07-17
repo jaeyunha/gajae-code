@@ -72,6 +72,22 @@ import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
 
+const EXPECTED_COMPUTER_BROKER_ACQUISITION_FAILURE_CODES = new Set([
+	"COMPUTER_BROKER_UNAVAILABLE",
+	"COMPUTER_BROKER_TIMEOUT",
+	"COMPUTER_BROKER_PROTOCOL",
+]);
+
+function isExpectedComputerBrokerAcquisitionFailure(error: unknown): error is { code: string } {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		typeof error.code === "string" &&
+		EXPECTED_COMPUTER_BROKER_ACQUISITION_FAILURE_CODES.has(error.code)
+	);
+}
+
 async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
 	try {
 		const response = await fetch("https://registry.npmjs.org/@gajae-code/coding-agent/latest");
@@ -1038,7 +1054,12 @@ export async function runRootCommand(
 	let bareResumeSessionManager: SessionManager | undefined;
 	let bareResumeAction: "continue-tail" | "open-idle" | undefined;
 
-	await (deps.acquireComputerBrokerLease ?? acquireComputerBrokerLeaseFromEnvironment)().catch(() => undefined);
+	try {
+		await (deps.acquireComputerBrokerLease ?? acquireComputerBrokerLeaseFromEnvironment)();
+	} catch (error) {
+		if (!isExpectedComputerBrokerAcquisitionFailure(error)) throw error;
+		logger.warn("Managed computer broker unavailable; computer actions will fail closed.", { code: error.code });
+	}
 	if (isBareResume(parsedArgs)) {
 		if (hasBareResumeConflict(parsedArgs)) {
 			process.stderr.write(`${BARE_RESUME_CONFLICT_ERROR}\n`);

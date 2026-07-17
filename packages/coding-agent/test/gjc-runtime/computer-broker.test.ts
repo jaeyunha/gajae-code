@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as childProcess from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -116,7 +117,7 @@ async function closeServer(server: net.Server): Promise<void> {
 	await closed.promise;
 }
 
-describe("computer broker", () => {
+describe.serial("computer broker", () => {
 	it("does not create a controller without broker environment", () => {
 		for (const key of brokerEnv) delete process.env[key];
 		expect(createComputerBrokerControllerFromEnvironment()).toBeNull();
@@ -132,6 +133,20 @@ describe("computer broker", () => {
 		expect(() => createComputerBrokerControllerFromEnvironment()).not.toThrow("a".repeat(64));
 	});
 
+	it("scrubs invalid bootstrap metadata and leaves the broker required", () => {
+		process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = "/tmp/not-a-broker.sock";
+		process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = "a".repeat(64);
+		delete process.env[GJC_COMPUTER_BROKER_DIR_ENV];
+		initializeComputerBrokerLeaseFromEnvironment();
+		expect(process.env[GJC_COMPUTER_BROKER_SOCKET_ENV]).toBeUndefined();
+		expect(process.env[GJC_COMPUTER_BROKER_TOKEN_ENV]).toBeUndefined();
+		expect(process.env[GJC_COMPUTER_BROKER_DIR_ENV]).toBeUndefined();
+		expect(process.env[GJC_COMPUTER_BROKER_REQUIRED_ENV]).toBe("1");
+		expect(() => createComputerBrokerControllerFromEnvironment()).toThrow(
+			"Computer broker is required but unavailable",
+		);
+	});
+
 	it("fails closed when managed tmux marks the broker required but unavailable", () => {
 		delete process.env[GJC_COMPUTER_BROKER_SOCKET_ENV];
 		delete process.env[GJC_COMPUTER_BROKER_TOKEN_ENV];
@@ -144,6 +159,20 @@ describe("computer broker", () => {
 
 	it("refuses source-mode managed tmux ownership", () => {
 		expect(startComputerBrokerForTmux({ env: {}, isCompiledBinary: () => false })).toBeNull();
+	});
+
+	it("returns null when the spawned helper exits before creating its socket", async () => {
+		const startedAt = Date.now();
+		expect(
+			startComputerBrokerForTmux({
+				env: {},
+				isCompiledBinary: () => true,
+				startupTimeoutMs: 3_000,
+				spawn: () => childProcess.spawn(process.execPath, ["-e", "process.exit(1)"], { stdio: "ignore" }),
+			}),
+		).toBeNull();
+		expect(Date.now() - startedAt).toBeLessThan(1_000);
+		await Bun.sleep(10);
 	});
 
 	it.if(process.platform === "darwin")("removes an unclaimed broker after the startup deadline", async () => {
@@ -193,6 +222,10 @@ describe("computer broker", () => {
 					response === "malformed" ? "COMPUTER_BROKER_PROTOCOL" : "COMPUTER_BROKER_UNAVAILABLE",
 				);
 			}
+			expect(process.env[GJC_COMPUTER_BROKER_SOCKET_ENV]).toBeUndefined();
+			expect(process.env[GJC_COMPUTER_BROKER_TOKEN_ENV]).toBeUndefined();
+			expect(process.env[GJC_COMPUTER_BROKER_DIR_ENV]).toBeUndefined();
+			expect(process.env[GJC_COMPUTER_BROKER_REQUIRED_ENV]).toBe("1");
 			disposeComputerBrokerLease();
 			const closed = Promise.withResolvers<void>();
 			server.close(error => {
@@ -203,6 +236,47 @@ describe("computer broker", () => {
 			fs.rmSync(directory, { recursive: true, force: true });
 		}
 	});
+	it.if(process.platform === "darwin")(
+		"does not write expired absolute-deadline work after lease acquisition",
+		async () => {
+			const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-deadline-"));
+			const socketPath = path.join(directory, "broker.sock");
+			const token = "6".repeat(64);
+			let requestReceived = false;
+			const server = net.createServer(socket => {
+				const frames = socketFrames(socket);
+				void (async () => {
+					expect(await frames.next()).toEqual({ version: 1, type: "lease", token });
+					await Bun.sleep(25);
+					socket.write(`${JSON.stringify({ version: 1, type: "lease_ack", ok: true })}\n`);
+					requestReceived =
+						(await Promise.race([
+							frames.next().then(
+								() => true,
+								() => false,
+							),
+							Bun.sleep(25).then(() => false),
+						])) === true;
+				})().catch(() => socket.destroy());
+			});
+			await listen(server, socketPath);
+			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
+			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
+			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+			const controller = createComputerBrokerControllerFromEnvironment();
+			if (!controller?.brokerInvoke) throw new Error("expected broker invocation");
+			await expect(
+				controller.brokerInvoke("wait", [null, 1], { deadlineAtMs: Date.now() + 5 }),
+			).rejects.toMatchObject({
+				code: "COMPUTER_BROKER_TIMEOUT",
+			});
+			await Bun.sleep(30);
+			expect(requestReceived).toBe(false);
+			disposeComputerBrokerLease();
+			await closeServer(server);
+			fs.rmSync(directory, { recursive: true, force: true });
+		},
+	);
 
 	it.if(process.platform === "darwin")(
 		"rejects unauthenticated and malformed request frames, then cleans up after lease close",
@@ -485,6 +559,11 @@ describe("computer broker", () => {
 				throw new Error("expected complete broker controller");
 			const screenshot = await controller.screenshot();
 			expect(Buffer.from(screenshot.png as Uint8Array)).toEqual(Buffer.from([1, 2, 3]));
+			expect(process.env[GJC_COMPUTER_BROKER_SOCKET_ENV]).toBeUndefined();
+			expect(process.env[GJC_COMPUTER_BROKER_TOKEN_ENV]).toBeUndefined();
+			expect(process.env[GJC_COMPUTER_BROKER_DIR_ENV]).toBeUndefined();
+			expect(process.env[GJC_COMPUTER_BROKER_REQUIRED_ENV]).toBe("1");
+			expect(createComputerBrokerControllerFromEnvironment()?.brokerInvoke).toBeDefined();
 			expect(screenshot).toMatchObject({ widthPx: 2, heightPx: 1, displayEpoch: 42, captureId: 7 });
 			await controller.click(42, 1, 2, "middle");
 			await controller.brokerInvoke("doubleClick", [42, 3, 4, "right"]);
@@ -620,6 +699,25 @@ describe("computer broker", () => {
 			expect(fs.existsSync(directory)).toBe(false);
 		},
 	);
+
+	it.if(process.platform === "darwin")("surfaces cleanup failure when the runtime directory remains", async () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-cleanup-"));
+		const socket = path.join(directory, "broker.sock");
+		const token = "7".repeat(64);
+		const server = runComputerBrokerServerFromEnvironment({
+			env: {
+				[GJC_COMPUTER_BROKER_DIR_ENV]: directory,
+				[GJC_COMPUTER_BROKER_SOCKET_ENV]: socket,
+				[GJC_COMPUTER_BROKER_TOKEN_ENV]: token,
+			},
+			controller: {},
+			startupTimeoutMs: 50,
+		});
+		await waitForSocket(socket);
+		fs.writeFileSync(path.join(directory, "block-cleanup"), "x");
+		await expect(server).rejects.toMatchObject({ code: "COMPUTER_BROKER_CLEANUP_FAILED" });
+		fs.rmSync(directory, { recursive: true, force: true });
+	});
 
 	it("lease initialization is a synchronous no-op without broker configuration", () => {
 		for (const key of brokerEnv) delete process.env[key];

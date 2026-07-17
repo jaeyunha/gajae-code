@@ -101,6 +101,25 @@ describe("computer broker Gate-0", () => {
 		}
 	});
 
+	it("does not dispatch the hidden broker for normal, help, or version argv", async () => {
+		const previousExitCode = process.exitCode;
+		let invocations = 0;
+		try {
+			for (const argv of [["stats", "--help"], ["--help"], ["--version"]]) {
+				process.exitCode = 0;
+				await runCli(argv, {
+					runComputerBrokerFromEnvironment: async () => {
+						invocations++;
+					},
+				});
+				expect(process.exitCode).toBe(0);
+			}
+			expect(invocations).toBe(0);
+		} finally {
+			process.exitCode = previousExitCode ?? 0;
+		}
+	});
+
 	it.if(process.platform === "darwin")("fails closed when hidden malloc re-exec cannot start", async () => {
 		const previousMalloc = process.env.MallocStackLogging;
 		const previousGuard = process.env.GJC_MALLOC_ENV_REEXEC;

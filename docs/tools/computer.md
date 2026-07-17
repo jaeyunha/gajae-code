@@ -1,6 +1,6 @@
 # computer
 
-> Apple Silicon macOS desktop screenshot and input control through the native supervisor-gated computer controller.
+> macOS desktop screenshot and input control through the native supervisor-gated computer controller, callable by default on supported Apple Silicon hosts.
 
 ## Source
 
@@ -69,12 +69,16 @@ Stable computer error codes include:
 - `COMPUTER_DISPLAY_STALE`
 - `COMPUTER_COORD_INVALID`
 - `COMPUTER_CANCELLED`
+- `COMPUTER_TIMEOUT` — the local action, broker lease, or broker request exceeded the shared bounded deadline. Expired queued work is rejected before late dispatch; side-effecting input already dispatched is awaited to terminal settlement before timeout is reported.
 - `COMPUTER_BROKER_UNAVAILABLE` — the required packaged owner could not be started, claimed, or reached; a managed session never falls back to an inner native controller.
-- `COMPUTER_BROKER_TIMEOUT` — establishing the authenticated broker lease exceeded its bounded startup deadline.
+- `COMPUTER_AUDIT_UNAVAILABLE` — the enabled audit sink could not be prepared, so no computer action was performed.
+- `COMPUTER_AUDIT_INCOMPLETE` — the action may already have completed but its audit record could not be appended; do not retry automatically.
 
-Broker authentication and framing failures are internal transport errors and are not public configuration surfaces.
+Broker authentication, framing, and lease-timeout failures are internal transport errors and are not public configuration surfaces; public deadline expiry is reported as `COMPUTER_TIMEOUT`.
 
-TS handles settings/platform exposure and UX mapping. Native `execute_action` remains the side-effect authority for supervisor state, permissions, display freshness, coordinate validation, and cancellation.
+When computer audit logging is enabled, GJC prepares the mode-`0600` audit file before side-effecting input. Audit records contain only timestamp, action name, status, public error code, and optional screenshot dimensions; they never persist coordinates, scroll values, buttons, keys, typed text, wait values, screenshot bytes, broker credentials, socket paths, or screenshot artifact paths.
+
+TS handles settings/platform exposure and UX mapping. Native `execute_action` remains the side-effect authority for supervisor state, permissions, display freshness, coordinate validation, cancellation, and release-all behavior.
 
 ## Rendering
 

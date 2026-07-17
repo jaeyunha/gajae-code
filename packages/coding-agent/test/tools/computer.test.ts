@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	GJC_COMPUTER_BROKER_DIR_ENV,
+	GJC_COMPUTER_BROKER_REQUIRED_ENV,
 	GJC_COMPUTER_BROKER_SOCKET_ENV,
 	GJC_COMPUTER_BROKER_TOKEN_ENV,
 } from "@gajae-code/coding-agent/gjc-runtime/computer-broker";
@@ -26,6 +27,9 @@ import { toolRenderers } from "@gajae-code/coding-agent/tools/renderers";
 import { zlibSync } from "fflate";
 
 function createSession(settings = Settings.isolated(), sessionFile: string | null = null): ToolSession {
+	if (sessionFile === null && !settings.has("computer.auditLog.enabled")) {
+		settings.override("computer.auditLog.enabled", false);
+	}
 	return {
 		cwd: "/tmp/test",
 		hasUI: false,
@@ -412,6 +416,52 @@ describe("computer tool gating", () => {
 		expect(textOf(result)).toContain("COMPUTER_DISABLED");
 		expect(constructed).toBe(false);
 	});
+
+	it("keeps tool construction usable while required, partial, and unreachable broker metadata fails closed", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const keys = [
+			GJC_COMPUTER_BROKER_REQUIRED_ENV,
+			GJC_COMPUTER_BROKER_SOCKET_ENV,
+			GJC_COMPUTER_BROKER_TOKEN_ENV,
+			GJC_COMPUTER_BROKER_DIR_ENV,
+		] as const;
+		const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+		const token = "b".repeat(64);
+		const cases: Array<Record<string, string>> = [
+			{ [GJC_COMPUTER_BROKER_REQUIRED_ENV]: "1" },
+			{ [GJC_COMPUTER_BROKER_SOCKET_ENV]: "/tmp/missing-broker.sock" },
+			{ [GJC_COMPUTER_BROKER_TOKEN_ENV]: token },
+			{ [GJC_COMPUTER_BROKER_DIR_ENV]: "/tmp" },
+			{ [GJC_COMPUTER_BROKER_SOCKET_ENV]: "/tmp/missing-broker.sock", [GJC_COMPUTER_BROKER_TOKEN_ENV]: token },
+			{ [GJC_COMPUTER_BROKER_SOCKET_ENV]: "/tmp/missing-broker.sock", [GJC_COMPUTER_BROKER_DIR_ENV]: "/tmp" },
+			{ [GJC_COMPUTER_BROKER_TOKEN_ENV]: token, [GJC_COMPUTER_BROKER_DIR_ENV]: "/tmp" },
+			{
+				[GJC_COMPUTER_BROKER_SOCKET_ENV]: "/tmp/missing-broker.sock",
+				[GJC_COMPUTER_BROKER_TOKEN_ENV]: token,
+				[GJC_COMPUTER_BROKER_DIR_ENV]: "/tmp",
+			},
+		];
+		try {
+			for (const metadata of cases) {
+				for (const key of keys) delete process.env[key];
+				Object.assign(process.env, metadata);
+				const session = createSession(Settings.isolated({ "computer.enabled": true }));
+				expect(() => ComputerTool.createIf(session)).not.toThrow();
+				const toolNames = (await createTools(session)).map(tool => tool.name);
+				expect(toolNames).toContain("computer");
+				const result = await new ComputerTool(session).execute("invalid-broker", { action: "screenshot" });
+				expect(result.details?.code).toBe("COMPUTER_BROKER_UNAVAILABLE");
+				expect(textOf(result)).not.toContain(token);
+			}
+		} finally {
+			for (const key of keys) {
+				const value = previous[key];
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
 });
 
 describe("computer tool dispatch", () => {
@@ -524,7 +574,7 @@ describe("computer tool dispatch", () => {
 
 			expect(result.isError).toBe(true);
 			expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
-			expect(textOf(result)).toContain(`ComputerController.${testCase.method} is unavailable`);
+			expect(textOf(result)).toContain("Computer control is unavailable.");
 		}
 	});
 
@@ -548,7 +598,7 @@ describe("computer tool dispatch", () => {
 
 		expect(result.isError).toBe(true);
 		expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
-		expect(textOf(result)).toContain("ComputerController.screenshot is unavailable");
+		expect(textOf(result)).toContain("Computer control is unavailable.");
 		expect(calls).toEqual(["click"]);
 	});
 
@@ -574,7 +624,7 @@ describe("computer tool dispatch", () => {
 		expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
 		expect(result.details?.steps).toHaveLength(1);
 		expect(result.details?.steps?.[0]?.code).toBe("COMPUTER_UNAVAILABLE");
-		expect(textOf(result)).toContain("ComputerController.screenshot is unavailable");
+		expect(textOf(result)).toContain("Computer control is unavailable.");
 		expect(calls).toEqual(["click"]);
 	});
 
@@ -964,7 +1014,7 @@ describe("computer tool dispatch", () => {
 
 		expect(Date.now() - started).toBeLessThan(1_090);
 		expect(result.isError).toBe(true);
-		expect(result.details?.code).toBe("COMPUTER_CANCELLED");
+		expect(result.details?.code).toBe("COMPUTER_TIMEOUT");
 		expect(calls).toEqual(["screenshot-start"]);
 	});
 
@@ -991,7 +1041,7 @@ describe("computer tool dispatch", () => {
 		expect(calls).toEqual(["type-start"]);
 		const result = await execution;
 		expect(result.isError).toBe(true);
-		expect(result.details?.code).toBe("COMPUTER_CANCELLED");
+		expect(result.details?.code).toBe("COMPUTER_TIMEOUT");
 		expect(calls).toEqual(["type-start", "type-end"]);
 	});
 
@@ -1156,7 +1206,7 @@ describe("computer tool dispatch", () => {
 		expect(result.details?.steps?.[0]?.status).toBe("success");
 		expect(result.details?.steps?.[1]?.status).toBe("error");
 		expect(result.details?.steps?.[1]?.code).toBe("COMPUTER_COORD_INVALID");
-		expect(result.details?.steps?.[1]?.message).toContain("outside the latest screenshot bounds");
+		expect(result.details?.steps?.[1]?.message).toContain("Coordinates are invalid for the current display.");
 		expect(result.details?.code).toBe("COMPUTER_COORD_INVALID");
 		expect(result.details?.screenshot?.path).toBeTruthy();
 		expect(await fs.stat(result.details?.screenshot?.path ?? "")).toMatchObject({ size: 3 });
@@ -1208,7 +1258,6 @@ describe("computer tool dispatch", () => {
 				"action",
 				"status",
 				"code",
-				"ms",
 				"screenshotWidthPx",
 				"screenshotHeightPx",
 			]);
@@ -1225,7 +1274,7 @@ describe("computer tool dispatch", () => {
 				expect(record).not.toHaveProperty("scrollX");
 				expect(record).not.toHaveProperty("scrollY");
 			}
-			expect(records.find(record => record.action === "wait")?.ms).toBe(7);
+			expect(records.find(record => record.action === "wait")).not.toHaveProperty("ms");
 			expect(records.find(record => record.action === "screenshot")).toMatchObject({
 				screenshotWidthPx: 10,
 				screenshotHeightPx: 20,
@@ -1263,7 +1312,7 @@ describe("computer tool dispatch", () => {
 		setComputerControllerFactoryForTests(() => ({
 			click: () => {
 				// Mirror the real NAPI error: stable code in the message, generic .code.
-				const error = new Error("COMPUTER_SUPERVISOR_NOT_LIVE: supervisor is not live") as Error & {
+				const error = new Error("COMPUTER_SUPERVISOR_NOT_LIVE: RAW_NATIVE_SECRET_909") as Error & {
 					code: string;
 				};
 				error.code = "GenericFailure";
@@ -1274,7 +1323,64 @@ describe("computer tool dispatch", () => {
 		const result = await tool.execute("click", { action: "click", x: 1, y: 2 });
 		expect(result.isError).toBe(true);
 		expect(result.details?.code).toBe("COMPUTER_SUPERVISOR_NOT_LIVE");
-		expect(textOf(result)).toContain("supervisor is not live");
+		expect(textOf(result)).not.toContain("RAW_NATIVE_SECRET_909");
+	});
+
+	it("fails closed before dispatch when enabled audit storage is unavailable", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		let calls = 0;
+		setComputerControllerFactoryForTests(() => ({
+			click: () => {
+				calls += 1;
+			},
+		}));
+		const result = await new ComputerTool(
+			createSession(Settings.isolated({ "computer.enabled": true, "computer.auditLog.enabled": true })),
+		).execute("audit-unavailable", { action: "click", x: 1, y: 2 });
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_AUDIT_UNAVAILABLE");
+		expect(calls).toBe(0);
+	});
+
+	it("reports non-retryable audit ambiguity after success, mapped error, and abort", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		for (const phase of ["success", "error", "abort"] as const) {
+			const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `computer-audit-${phase}-`));
+			await fs.chmod(tmpDir, 0o700);
+			const sessionFile = path.join(tmpDir, "session.jsonl");
+			const auditPath = path.join(tmpDir, ".computer-audit.jsonl");
+			try {
+				setComputerControllerFactoryForTests(() => ({
+					click: async () => {
+						await fs.rm(auditPath, { force: true });
+						await fs.mkdir(auditPath);
+						if (phase === "abort") await sleep(50);
+						if (phase === "error") throw new Error("COMPUTER_DISPLAY_STALE: RAW_AUDIT_SECRET_909");
+					},
+				}));
+				const tool = new ComputerTool(
+					createSession(
+						Settings.isolated({ "computer.enabled": true, "computer.auditLog.enabled": true }),
+						sessionFile,
+					),
+				);
+				const abortController = phase === "abort" ? new AbortController() : undefined;
+				const execution = tool.execute(
+					`audit-${phase}`,
+					{ action: "click", x: 101, y: 202 },
+					abortController?.signal,
+				);
+				if (abortController) setTimeout(() => abortController.abort(), 5);
+				const result = await execution;
+				expect(result.details?.code).toBe("COMPUTER_AUDIT_INCOMPLETE");
+				expect(textOf(result)).toContain("Do not retry automatically");
+				expect(textOf(result)).not.toContain("RAW_AUDIT_SECRET_909");
+			} finally {
+				await fs.rm(tmpDir, { recursive: true, force: true });
+			}
+		}
 	});
 });
 

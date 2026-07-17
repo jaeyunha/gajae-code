@@ -147,14 +147,29 @@ export type ComputerControllerFactory = () => ComputerControllerLike;
 
 export const COMPUTER_DISABLED_CODE = "COMPUTER_DISABLED";
 
-const NATIVE_ERROR_CODES = new Set([
+const PUBLIC_COMPUTER_ERROR_CODES = new Set([
+	"COMPUTER_UNAVAILABLE",
 	"COMPUTER_SUSPENDED",
 	"COMPUTER_SUPERVISOR_NOT_LIVE",
 	"COMPUTER_PERMISSION_REQUIRED",
 	"COMPUTER_DISPLAY_STALE",
 	"COMPUTER_COORD_INVALID",
 	"COMPUTER_CANCELLED",
+	"COMPUTER_TIMEOUT",
+	COMPUTER_DISABLED_CODE,
 ]);
+
+const PUBLIC_COMPUTER_REASONS: Record<string, string> = {
+	COMPUTER_UNAVAILABLE: "Computer control is unavailable.",
+	COMPUTER_SUSPENDED: "Computer control is suspended.",
+	COMPUTER_SUPERVISOR_NOT_LIVE: "Computer supervisor is not live.",
+	COMPUTER_PERMISSION_REQUIRED: "Required screen recording or accessibility permission is missing.",
+	COMPUTER_DISPLAY_STALE: "The display changed since the last screenshot.",
+	COMPUTER_COORD_INVALID: "Coordinates are invalid for the current display.",
+	COMPUTER_CANCELLED: "Computer action was cancelled.",
+	COMPUTER_TIMEOUT: "Computer action timed out.",
+	COMPUTER_DISABLED: "The computer tool is disabled or unsupported.",
+};
 
 function createNativeComputerController(): ComputerControllerLike {
 	const brokerController = createComputerBrokerControllerFromEnvironment();
@@ -283,22 +298,31 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<ComputerToolDetails>> {
 		const details = detailsFromParams(params);
+		let dispatchStarted = false;
 		const hotkey = this.session.settings.get("computer.killSwitchHotkey") as string | undefined;
 		if (!isComputerCallable(this.session)) {
 			details.status = "disabled";
 			details.code = COMPUTER_DISABLED_CODE;
 			details.message =
 				"The computer tool is disabled or unsupported. It requires Apple Silicon macOS; set computer.alwaysOn=false to disable, or computer.enabled=true to manually enable on a supported host.";
-			await writeComputerAuditLog(this.session, details);
-			return { ...toolResult(details).text(`${COMPUTER_DISABLED_CODE}: ${details.message}`).done(), isError: true };
+			try {
+				await writeComputerAuditLog(this.session, details);
+			} catch {
+				details.status = "error";
+				details.code = "COMPUTER_AUDIT_UNAVAILABLE";
+				details.message = "Computer audit log is unavailable; no computer action was performed.";
+			}
+			return { ...toolResult(details).text(`${details.code}: ${details.message}`).done(), isError: true };
 		}
 
 		try {
 			throwIfAborted(signal);
+			await prepareComputerAuditLog(this.session);
 			const timeoutSeconds = clampTimeout("computer", params.timeout);
 			const timeoutMs = timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
 			const controller = controllerFactory();
 			const deadline = createComputerDeadline(timeoutMs);
+			dispatchStarted = true;
 			if (params.action === "batch") {
 				const batchResult = await dispatchBatchComputerActions(
 					controller,
@@ -371,12 +395,30 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 						.done()
 				: toolResult(details).text(details.message).done();
 		} catch (error) {
-			if (error instanceof ToolAbortError) throw error;
+			if (error instanceof ComputerAuditError) {
+				details.status = "error";
+				details.code =
+					error.phase === "append" && dispatchStarted ? "COMPUTER_AUDIT_INCOMPLETE" : "COMPUTER_AUDIT_UNAVAILABLE";
+				details.message =
+					details.code === "COMPUTER_AUDIT_INCOMPLETE"
+						? "Computer action may already have completed, but its audit record could not be written. Do not retry automatically."
+						: "Computer audit log is unavailable; no computer action was performed.";
+				return { ...toolResult(details).text(`${details.code}: ${details.message}`).done(), isError: true };
+			}
 			const mapped = mapComputerError(error, hotkey);
 			details.status = mapped.code === COMPUTER_DISABLED_CODE ? "disabled" : "error";
 			details.code = mapped.code;
 			details.message = mapped.message;
-			await writeComputerAuditLog(this.session, details);
+			try {
+				await writeComputerAuditLog(this.session, details);
+			} catch {
+				details.code = dispatchStarted ? "COMPUTER_AUDIT_INCOMPLETE" : "COMPUTER_AUDIT_UNAVAILABLE";
+				details.message = dispatchStarted
+					? "Computer action may already have completed, but its audit record could not be written. Do not retry automatically."
+					: "Computer audit log is unavailable; no computer action was performed.";
+				return { ...toolResult(details).text(`${details.code}: ${details.message}`).done(), isError: true };
+			}
+			if (error instanceof ToolAbortError) throw error;
 			return { ...toolResult(details).text(`${mapped.code}: ${mapped.message}`).done(), isError: true };
 		}
 	}
@@ -450,11 +492,13 @@ function invokeComputerController(
 	deadline: ComputerDeadline | undefined,
 	signal?: AbortSignal,
 ): unknown {
+	assertComputerDeadline(deadline);
 	if (controller.brokerInvoke)
 		return controller.brokerInvoke(method, args, {
 			timeoutMs: remainingComputerTimeoutMs(deadline),
+			deadlineAtMs: deadline?.expiresAtEpochMs,
 			signal,
-		});
+		} as Parameters<NonNullable<ComputerControllerLike["brokerInvoke"]>>[2] & { deadlineAtMs?: number });
 	const nativeMethod = controller[method];
 	if (typeof nativeMethod !== "function") missingNativeMethod(action, method);
 	return (nativeMethod as (...values: unknown[]) => unknown).apply(controller, args);
@@ -472,6 +516,7 @@ function shouldCapturePostActionScreenshot(
 
 interface ComputerDeadline {
 	expiresAtMs: number;
+	expiresAtEpochMs: number;
 }
 
 class ComputerTimeoutError extends Error {
@@ -485,15 +530,23 @@ function createComputerDeadline(
 	timeoutMs: number | undefined,
 	parent?: ComputerDeadline,
 ): ComputerDeadline | undefined {
-	const localExpiresAt = timeoutMs && timeoutMs > 0 ? performance.now() + timeoutMs : undefined;
-	const parentExpiresAt = parent?.expiresAtMs;
+	const now = performance.now();
+	const nowEpoch = Date.now();
+	const localExpiresAt = timeoutMs && timeoutMs > 0 ? now + timeoutMs : undefined;
+	const localExpiresAtEpoch = timeoutMs && timeoutMs > 0 ? nowEpoch + timeoutMs : undefined;
 	const expiresAtMs =
 		localExpiresAt === undefined
-			? parentExpiresAt
-			: parentExpiresAt === undefined
+			? parent?.expiresAtMs
+			: parent === undefined
 				? localExpiresAt
-				: Math.min(localExpiresAt, parentExpiresAt);
-	return expiresAtMs === undefined ? undefined : { expiresAtMs };
+				: Math.min(localExpiresAt, parent.expiresAtMs);
+	const expiresAtEpochMs =
+		localExpiresAtEpoch === undefined
+			? parent?.expiresAtEpochMs
+			: parent === undefined
+				? localExpiresAtEpoch
+				: Math.min(localExpiresAtEpoch, parent.expiresAtEpochMs);
+	return expiresAtMs === undefined || expiresAtEpochMs === undefined ? undefined : { expiresAtMs, expiresAtEpochMs };
 }
 
 function remainingComputerTimeoutMs(deadline: ComputerDeadline | undefined): number | undefined {
@@ -881,23 +934,30 @@ function formatByteCount(bytes: number): string {
 }
 
 function mapComputerError(error: unknown, hotkey?: string): { code: string; message: string } {
-	if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+	if (error instanceof ComputerTimeoutError || (error instanceof Error && error.name === "TimeoutError"))
+		return { code: "COMPUTER_TIMEOUT", message: "Computer action timed out. Do not assume the action completed." };
+	if (error instanceof Error && error.name === "AbortError") {
 		return {
 			code: "COMPUTER_CANCELLED",
 			message: `Computer action was cancelled. Stop and wait for the user${hotkey ? ` (kill-switch hotkey: ${hotkey})` : ""}.`,
 		};
 	}
 	const maybe = error as { code?: unknown; message?: unknown };
-	const rawMessage =
-		typeof maybe?.message === "string" && maybe.message.length > 0 ? maybe.message : "Computer action failed.";
 	const rawCode = typeof maybe?.code === "string" ? maybe.code : undefined;
-	const isComputerCode = (value: string | undefined): value is string =>
-		value !== undefined && (NATIVE_ERROR_CODES.has(value) || value.startsWith("COMPUTER_"));
-	// Native NAPI errors carry the stable code in the message ("CODE: reason") with
-	// error.code set to the NAPI status, so fall back to the message prefix.
+	const rawMessage = typeof maybe?.message === "string" ? maybe.message : "";
 	const messageCode = /^(COMPUTER_[A-Z_]+):/.exec(rawMessage)?.[1];
-	const code = isComputerCode(rawCode) ? rawCode : (messageCode ?? "COMPUTER_ERROR");
-	const reason = messageCode ? rawMessage.slice(messageCode.length + 1).trim() : rawMessage;
+	const code =
+		rawCode === "COMPUTER_BROKER_TIMEOUT"
+			? "COMPUTER_TIMEOUT"
+			: PUBLIC_COMPUTER_ERROR_CODES.has(rawCode ?? "")
+				? rawCode!
+				: PUBLIC_COMPUTER_ERROR_CODES.has(messageCode ?? "")
+					? messageCode!
+					: "COMPUTER_BROKER_UNAVAILABLE";
+	const reason =
+		code === "COMPUTER_BROKER_UNAVAILABLE"
+			? "Computer broker is unavailable."
+			: (PUBLIC_COMPUTER_REASONS[code] ?? "Computer action failed.");
 	const recoveryHints: Record<string, string> = {
 		COMPUTER_COORD_INVALID: "Capture a fresh screenshot and use coordinates within its frame.",
 		COMPUTER_DISPLAY_STALE:
@@ -911,8 +971,7 @@ function mapComputerError(error: unknown, hotkey?: string): { code: string; mess
 			"The computer tool is disabled or unsupported. Do not retry without enabling it on Apple Silicon macOS.",
 	};
 	const hint = recoveryHints[code];
-	const message = hint ? `${code}: ${reason} ${hint}` : `${code}: ${reason}`;
-	return { code, message };
+	return { code, message: hint ? `${code}: ${reason} ${hint}` : `${code}: ${reason}` };
 }
 
 interface ComputerAuditRecord {
@@ -920,9 +979,14 @@ interface ComputerAuditRecord {
 	action: ComputerActionName;
 	status: "success" | "error" | "disabled";
 	code?: string;
-	ms?: number;
 	screenshotWidthPx?: number;
 	screenshotHeightPx?: number;
+}
+
+class ComputerAuditError extends Error {
+	constructor(readonly phase: "prepare" | "append") {
+		super("Computer audit log is unavailable.");
+	}
 }
 
 function auditRecordFromDetails(details: ComputerToolDetails): ComputerAuditRecord {
@@ -932,7 +996,6 @@ function auditRecordFromDetails(details: ComputerToolDetails): ComputerAuditReco
 		status: details.status,
 	};
 	if (details.code) record.code = details.code;
-	if (details.ms !== undefined) record.ms = details.ms;
 	if (details.screenshot) {
 		record.screenshotWidthPx = details.screenshot.widthPx;
 		record.screenshotHeightPx = details.screenshot.heightPx;
@@ -941,61 +1004,70 @@ function auditRecordFromDetails(details: ComputerToolDetails): ComputerAuditReco
 }
 
 async function isSecureComputerAuditDirectory(directory: string): Promise<boolean> {
-	const resolved = path.resolve(directory);
-	const root = path.parse(resolved).root;
-	const segments = path.relative(root, resolved).split(path.sep).filter(Boolean);
-	if (segments.length === 0) return false;
-	let current = root;
-	for (const [index, segment] of segments.entries()) {
-		current = path.join(current, segment);
-		const stat = await fs.lstat(current);
-		if (stat.isSymbolicLink()) {
-			if (index === segments.length - 1 || stat.uid !== 0 || (stat.mode & 0o022) !== 0) return false;
-			continue;
-		}
-		if (!stat.isDirectory()) return false;
-		if (
-			index === segments.length - 1 &&
-			((stat.mode & 0o022) !== 0 || (typeof process.getuid === "function" && stat.uid !== process.getuid()))
-		)
-			return false;
+	try {
+		const stat = await fs.lstat(directory);
+		return (
+			stat.isDirectory() &&
+			!stat.isSymbolicLink() &&
+			(stat.mode & 0o022) === 0 &&
+			(typeof process.getuid !== "function" || stat.uid === process.getuid())
+		);
+	} catch {
+		return false;
 	}
-	return true;
 }
 
-async function appendComputerAuditRecord(auditPath: string, record: ComputerAuditRecord): Promise<void> {
-	const handle = await fs.open(
-		auditPath,
-		nodeFs.constants.O_APPEND | nodeFs.constants.O_CREAT | nodeFs.constants.O_WRONLY | nodeFs.constants.O_NOFOLLOW,
-		0o600,
-	);
+function computerAuditPath(session: ToolSession, phase: "prepare" | "append"): string | undefined {
+	if (!session.settings.get("computer.auditLog.enabled")) return undefined;
+	const sessionFile = session.getSessionFile();
+	if (!sessionFile) throw new ComputerAuditError(phase);
+	return path.join(path.dirname(sessionFile), ".computer-audit.jsonl");
+}
+
+async function openSecureComputerAuditLog(auditPath: string, phase: "prepare" | "append"): Promise<fs.FileHandle> {
+	if (!(await isSecureComputerAuditDirectory(path.dirname(auditPath)))) throw new ComputerAuditError(phase);
 	try {
+		const handle = await fs.open(
+			auditPath,
+			nodeFs.constants.O_APPEND | nodeFs.constants.O_CREAT | nodeFs.constants.O_WRONLY | nodeFs.constants.O_NOFOLLOW,
+			0o600,
+		);
 		const stat = await handle.stat();
-		if (!stat.isFile() || (typeof process.getuid === "function" && stat.uid !== process.getuid())) return;
+		if (!stat.isFile() || (typeof process.getuid === "function" && stat.uid !== process.getuid())) {
+			await handle.close();
+			throw new ComputerAuditError(phase);
+		}
 		if ((stat.mode & 0o777) !== 0o600) await handle.chmod(0o600);
-		await handle.appendFile(`${JSON.stringify(record)}\n`, "utf8");
-	} finally {
-		await handle.close();
+		return handle;
+	} catch (error) {
+		if (error instanceof ComputerAuditError) throw error;
+		throw new ComputerAuditError(phase);
 	}
+}
+
+async function prepareComputerAuditLog(session: ToolSession): Promise<void> {
+	const auditPath = computerAuditPath(session, "prepare");
+	if (!auditPath) return;
+	const handle = await openSecureComputerAuditLog(auditPath, "prepare");
+	await handle.close();
 }
 
 async function writeComputerAuditLog(session: ToolSession, details: ComputerToolDetails): Promise<void> {
-	if (!session.settings.get("computer.auditLog.enabled")) return;
-	const sessionFile = session.getSessionFile();
-	if (!sessionFile) return;
-	const auditDirectory = path.dirname(sessionFile);
-	if (!(await isSecureComputerAuditDirectory(auditDirectory))) return;
-	const auditPath = path.join(auditDirectory, ".computer-audit.jsonl");
-	const record = auditRecordFromDetails(details);
-	if (details.steps) {
-		for (const step of details.steps) {
-			await writeComputerAuditLog(session, step);
-		}
-	}
+	const auditPath = computerAuditPath(session, "append");
+	if (!auditPath) return;
 	try {
-		await appendComputerAuditRecord(auditPath, record);
-	} catch {
-		// Audit logging is best-effort; do not let it fail the action.
+		if (details.steps) {
+			for (const step of details.steps) await writeComputerAuditLog(session, step);
+		}
+		const handle = await openSecureComputerAuditLog(auditPath, "append");
+		try {
+			await handle.appendFile(`${JSON.stringify(auditRecordFromDetails(details))}\n`, "utf8");
+		} finally {
+			await handle.close();
+		}
+	} catch (error) {
+		if (error instanceof ComputerAuditError) throw error;
+		throw new ComputerAuditError("append");
 	}
 }
 

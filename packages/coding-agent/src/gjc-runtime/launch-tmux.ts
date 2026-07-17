@@ -118,6 +118,13 @@ export interface TmuxLaunchContext {
 	architecture?: NodeJS.Architecture;
 }
 
+let activeComputerBrokerStarter = startComputerBrokerForTmux;
+
+/** @internal Test-only seam; production always uses the packaged broker starter. */
+export function __setComputerBrokerStarterForTests(starter: typeof startComputerBrokerForTmux | null): void {
+	activeComputerBrokerStarter = starter ?? startComputerBrokerForTmux;
+}
+
 export interface TmuxSpawnResult {
 	exitCode: number | null;
 	signalCode?: string | null;
@@ -1070,6 +1077,17 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	plan.newSessionArgs = [...plan.newSessionArgs.slice(0, -1), innerCommand];
 }
 
+function disposeComputerBrokerAfterFailure(
+	computerBroker: ComputerBrokerLaunch | null,
+	diagnostic: (message: string) => void,
+): void {
+	try {
+		computerBroker?.dispose();
+	} catch {
+		diagnostic("macOS computer broker cleanup failed; computer actions will fail closed in this tmux session.\n");
+	}
+}
+
 function defaultSpawnSync(command: string, args: string[], options: TmuxSpawnOptions): TmuxSpawnResult {
 	// Only attach-session is interactive. Every other command is control-plane
 	// traffic and must not write unbounded, untrusted terminal bytes directly.
@@ -1421,10 +1439,9 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		if (attached.exitCode === 0) return true;
 	}
 	let computerBroker: ComputerBrokerLaunch | null = null;
-	const brokerEligible = context.spawnSync === undefined || context.computerBrokerStarter !== undefined;
-	const computerBrokerStarter =
-		context.computerBrokerStarter ?? (context.spawnSync === undefined ? startComputerBrokerForTmux : undefined);
-	if (brokerEligible && plan.platform === "darwin" && (context.architecture ?? process.arch) === "arm64") {
+	const brokerEligible = plan.platform === "darwin" && (context.architecture ?? process.arch) === "arm64";
+	const computerBrokerStarter = context.computerBrokerStarter ?? activeComputerBrokerStarter;
+	if (brokerEligible) {
 		plan.computerBrokerEnvironment = { [GJC_COMPUTER_BROKER_REQUIRED_ENV]: "1" };
 		try {
 			computerBroker = computerBrokerStarter?.({ env, cwd: plan.cwd }) ?? null;
@@ -1443,16 +1460,17 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			);
 		}
 	}
+	const diagnostic = context.diagnosticWriter ?? safeStderrWrite;
 	try {
 		prepareManagedOwnerLifecycle(plan, context);
-	} catch (error) {
-		computerBroker?.dispose();
-		(context.diagnosticWriter ?? safeStderrWrite)(`tmux owner lifecycle publication failed: ${String(error)}`);
+	} catch {
+		diagnostic("tmux owner lifecycle publication failed.\n");
+		disposeComputerBrokerAfterFailure(computerBroker, diagnostic);
 		return true;
 	}
 	if (!plan.sessionId || !plan.sessionStateFile || !plan.ownerGeneration || !plan.tmuxCommand) {
-		computerBroker?.dispose();
-		(context.diagnosticWriter ?? safeStderrWrite)("tmux required ownership metadata was unavailable");
+		diagnostic("tmux required ownership metadata was unavailable");
+		disposeComputerBrokerAfterFailure(computerBroker, diagnostic);
 		return true;
 	}
 	let created: TmuxSpawnResult;
@@ -1465,10 +1483,9 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			ownerIsolationProbe,
 		);
 	} catch (error) {
-		computerBroker?.dispose();
+		disposeComputerBrokerAfterFailure(computerBroker, diagnostic);
 		throw error;
 	}
-	if (created.exitCode !== 0) computerBroker?.dispose();
 	if (created.exitCode === 0 && !plan.isPsmux && !plan.createdSessionId) {
 		// Native tmux must atomically disclose its immutable `$N` identity. Do not
 		// downgrade to the reusable session name or mutate the unidentified session.
@@ -1609,7 +1626,8 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		// hangs that look like a tmux/psmux failure from the user's seat).
 		const stderr = created.stderr;
 		const suffix = probeWarning ? ` Wrapper warning: ${probeWarning}` : "";
-		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("new-session failed", stderr) + suffix);
+		diagnostic(formatTmuxLaunchDiagnostic("new-session failed", stderr) + suffix);
+		disposeComputerBrokerAfterFailure(computerBroker, diagnostic);
 		return true;
 	}
 	if (!isCreatedTmuxSessionIdentityStable(plan, spawnSync, controlOptions, ownerIsolationProbe)) {
