@@ -60,6 +60,7 @@ export interface HostProcessIdentity {
 	pid: number;
 	executableSha256: string;
 	startTokenSha256: string;
+	startedAtMs: number;
 }
 
 export interface RestartProof {
@@ -108,6 +109,11 @@ export interface RunCellContinuityDependencies {
 	readArtifact?: (value: string) => Promise<ReleaseArtifact>;
 	codesign?: (artifact: string) => Promise<CodeSignSummary>;
 	sourceRevision?: () => Promise<string>;
+}
+
+export interface RunCellContinuityOptions {
+	baselineRequest?: boolean;
+	expectedBaseline?: { sha256: string; codesign: CodeSignSummary };
 }
 export interface RunCellContinuityResult {
 	sourceRevision: string;
@@ -478,8 +484,9 @@ export async function captureHostProcess(
 		const executable =
 			!executableResult.timedOut && executableResult.exitCode === 0 ? psField(executableResult.stdout, 1_024) : null;
 		const startToken = !startResult.timedOut && startResult.exitCode === 0 ? psField(startResult.stdout, 128) : null;
+		const startedAtMs = startToken ? Date.parse(startToken) : NaN;
 		const ppid = ppidText && /^\d+$/.test(ppidText) ? Number(ppidText) : NaN;
-		if (!Number.isSafeInteger(ppid) || ppid < 0 || !executable || !startToken)
+		if (!Number.isSafeInteger(ppid) || ppid < 0 || !executable || !startToken || !Number.isSafeInteger(startedAtMs))
 			fail("terminal host process ancestry is unavailable");
 		const record = { ppid, executable, startToken };
 		if (hostExecutableMatches(host, record.executable)) {
@@ -488,6 +495,7 @@ export async function captureHostProcess(
 				pid,
 				executableSha256: createHash("sha256").update(record.executable).digest("hex"),
 				startTokenSha256: createHash("sha256").update(record.startToken).digest("hex"),
+				startedAtMs,
 			};
 		}
 		pid = record.ppid;
@@ -500,7 +508,8 @@ function sameHostProcess(left: HostProcessIdentity, right: HostProcessIdentity):
 		left.host === right.host &&
 		left.pid === right.pid &&
 		left.executableSha256 === right.executableSha256 &&
-		left.startTokenSha256 === right.startTokenSha256
+		left.startTokenSha256 === right.startTokenSha256 &&
+		left.startedAtMs === right.startedAtMs
 	);
 }
 
@@ -512,11 +521,15 @@ export function requireStableHostProcess(
 	if (!sameHostProcess(before, after)) fail(`terminal host process changed during ${phase}`);
 }
 
-export function requireRestartedHostProcess(proof: HostProcessIdentity, current: HostProcessIdentity): void {
-	if (proof.host !== current.host || proof.executableSha256 !== current.executableSha256)
+export function requireRestartedHostProcess(proof: RestartProof, current: HostProcessIdentity): void {
+	const requestedAtMs = Date.parse(proof.requestedAt);
+	if (proof.hostProcess.host !== current.host || proof.hostProcess.executableSha256 !== current.executableSha256)
 		fail("restart proof does not match the current terminal host executable");
-	if (proof.pid === current.pid && proof.startTokenSha256 === current.startTokenSha256)
-		fail("restart proof does not prove a terminal host process restart");
+	if (
+		(proof.hostProcess.pid === current.pid && proof.hostProcess.startTokenSha256 === current.startTokenSha256) ||
+		current.startedAtMs <= requestedAtMs
+	)
+		fail("restart proof does not prove a terminal host process restart after the signed request");
 }
 
 export function requireRestartProofContinuity(proof: RestartProof, continuity: RunCellContinuityResult): void {
@@ -668,20 +681,39 @@ export async function runCellContinuity(
 	artifact: ReleaseArtifact,
 	topology: Topology,
 	dependencies: RunCellContinuityDependencies = {},
-	baselineRequest = true,
+	options: RunCellContinuityOptions = {},
 ): Promise<RunCellContinuityResult> {
 	const runPair = dependencies.runPair ?? runCellExperimentPair,
 		build = dependencies.build ?? buildReleaseArtifact,
 		readArtifact = dependencies.readArtifact ?? releaseArtifact,
 		codesign = dependencies.codesign ?? codesignSummary,
-		source = dependencies.sourceRevision ?? readSourceRevision;
+		source = dependencies.sourceRevision ?? readSourceRevision,
+		baselineRequest = options.baselineRequest ?? true,
+		expectedBaseline = options.expectedBaseline;
 	const sourceRevision = await source();
-	const baselineCodesign = await codesign(artifact.path);
-	if (!baselineCodesign.verified || baselineCodesign.signing !== "adhoc")
-		fail("baseline release artifact must have a verified ad-hoc signature");
-	const baselinePair = await runPair(artifact.path, topology, undefined, baselineRequest);
-
+	const verifyBaseline = async (
+		phase: "before" | "after",
+	): Promise<{ artifact: ReleaseArtifact; codesign: CodeSignSummary }> => {
+		const current = expectedBaseline ? await readArtifact(artifact.path) : artifact;
+		const currentCodesign = await codesign(current.path);
+		if (!currentCodesign.verified || currentCodesign.signing !== "adhoc") {
+			if (expectedBaseline) fail(`baseline release artifact changed ${phase} execution`);
+			fail("baseline release artifact must have a verified ad-hoc signature");
+		}
+		if (
+			current.sha256 !== artifact.sha256 ||
+			(expectedBaseline &&
+				(current.sha256 !== expectedBaseline.sha256 ||
+					currentCodesign.verified !== expectedBaseline.codesign.verified ||
+					currentCodesign.signing !== expectedBaseline.codesign.signing))
+		)
+			fail(`baseline release artifact changed ${phase} execution`);
+		return { artifact: current, codesign: currentCodesign };
+	};
+	const baselineBefore = await verifyBaseline("before");
+	const baselinePair = await runPair(baselineBefore.artifact.path, topology, undefined, baselineRequest);
 	if (!pairSucceeded(baselinePair, baselineRequest)) fail("baseline hidden experiment failed");
+	const baselineAfter = expectedBaseline ? await verifyBaseline("after") : baselineBefore;
 	await build();
 	const postBuildRevision = await source();
 	if (postBuildRevision !== sourceRevision) fail("source revision changed during rebuild");
@@ -692,7 +724,15 @@ export async function runCellContinuity(
 		fail("updated release artifact must have a verified ad-hoc signature");
 	const updatedPair = await runPair(updated.path, topology, undefined, false);
 	if (!pairSucceeded(updatedPair)) fail("updated hidden experiment failed");
-	return { sourceRevision, baseline: artifact, updated, baselineCodesign, updatedCodesign, baselinePair, updatedPair };
+	return {
+		sourceRevision,
+		baseline: baselineAfter.artifact,
+		updated,
+		baselineCodesign: baselineAfter.codesign,
+		updatedCodesign,
+		baselinePair,
+		updatedPair,
+	};
 }
 export async function acquireExperimentLock(root: string): Promise<() => Promise<void>> {
 	const lockPath = path.join(root, EXPERIMENT_LOCK_NAME);
@@ -754,6 +794,58 @@ export async function acquireExperimentLock(root: string): Promise<() => Promise
 	}
 	fail("a Gate-0 experiment is already running");
 }
+export interface DurablePublicationDependencies {
+	temporary?: string;
+	writeTemporary?: (temporary: string, contents: string) => Promise<void>;
+	commit?: (temporary: string, destination: string) => Promise<void>;
+	removeTemporary?: (temporary: string) => Promise<void>;
+}
+
+async function removeTemporary(temporary: string, remove: (target: string) => Promise<void>): Promise<void> {
+	try {
+		await remove(temporary);
+	} catch (error) {
+		if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+	}
+	try {
+		await fs.lstat(temporary);
+		fail("durable record temporary cleanup failed");
+	} catch (error) {
+		if (error instanceof Gate0RunnerError) throw error;
+		if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+	}
+}
+
+export async function publishDurableSignedRecord(
+	destination: string,
+	contents: string,
+	dependencies: DurablePublicationDependencies = {},
+): Promise<void> {
+	const temporary = dependencies.temporary ?? `${destination}.${randomBytes(12).toString("hex")}.tmp`;
+	const writeTemporary =
+		dependencies.writeTemporary ??
+		(async (target: string, value: string) => {
+			const handle = await fs.open(target, "wx", 0o600);
+			try {
+				await handle.writeFile(value);
+				await handle.sync();
+			} finally {
+				await handle.close();
+			}
+		});
+	const commit =
+		dependencies.commit ?? (async (temporaryPath: string, finalPath: string) => fs.link(temporaryPath, finalPath));
+	const cleanup = dependencies.removeTemporary ?? ((target: string) => fs.unlink(target));
+	try {
+		await writeTemporary(temporary, contents);
+		await commit(temporary, destination);
+	} catch (error) {
+		await removeTemporary(temporary, cleanup);
+		throw error;
+	}
+	await removeTemporary(temporary, cleanup);
+}
+
 async function writeReceipt(root: string, receipt: Gate0Receipt): Promise<void> {
 	const local = await signer(root);
 	const signed: SignedReceipt = {
@@ -764,11 +856,11 @@ async function writeReceipt(root: string, receipt: Gate0Receipt): Promise<void> 
 			value: sign(null, receiptPayload(receipt), local.privateKey).toString("base64"),
 		},
 	};
-	const file = `${receipt.cell.topology}-${receipt.cell.macos}-${receipt.cell.host}-${receipt.cell.arch}-${Date.now()}-${randomBytes(6).toString("hex")}.json`,
-		destination = path.join(root, "receipts", file),
-		temporary = `${destination}.tmp`;
-	await fs.writeFile(temporary, `${canonicalJson(signed as unknown as JsonValue)}\n`, { mode: 0o600, flag: "wx" });
-	await fs.rename(temporary, destination);
+	const file = `${receipt.cell.topology}-${receipt.cell.macos}-${receipt.cell.host}-${receipt.cell.arch}-${createHash("sha256").update(receiptPayload(receipt)).digest("hex")}.json`;
+	await publishDurableSignedRecord(
+		path.join(root, "receipts", file),
+		`${canonicalJson(signed as unknown as JsonValue)}\n`,
+	);
 }
 export function restartProofFile(collection: string, cell: Gate0Receipt["cell"]): string {
 	const name = `${collection}-${cell.topology}-${cell.macos}-${cell.host}-${cell.arch}.json`;
@@ -835,7 +927,11 @@ export function validRestartProof(value: unknown): value is RestartProof {
 	);
 }
 
-export async function writeRestartProof(root: string, proof: RestartProof): Promise<void> {
+export async function writeRestartProof(
+	root: string,
+	proof: RestartProof,
+	dependencies: DurablePublicationDependencies = {},
+): Promise<void> {
 	const local = await signer(root);
 	const signed: SignedRestartProof = {
 		proof,
@@ -846,7 +942,7 @@ export async function writeRestartProof(root: string, proof: RestartProof): Prom
 		},
 	};
 	const destination = path.join(root, RESTART_PROOFS_NAME, restartProofFile(proof.collectionId, proof.cell));
-	await fs.writeFile(destination, `${canonicalJson(signed as unknown as JsonValue)}\n`, { mode: 0o600, flag: "wx" });
+	await publishDurableSignedRecord(destination, `${canonicalJson(signed as unknown as JsonValue)}\n`, dependencies);
 }
 
 async function validateRestartProofDirectory(root: string): Promise<void> {
@@ -922,9 +1018,46 @@ export function restartRequestCode(result: ExperimentResult): RestartProof["requ
 	return result.code;
 }
 
+export async function recoverCommittedCellReceipt(
+	root: string,
+	collection: string,
+	cell: Gate0Receipt["cell"],
+	dependencies: Pick<PersistReceiptDependencies, "loadReceipts"> = {},
+): Promise<Gate0Receipt | null> {
+	const existing = (await (dependencies.loadReceipts ?? loadReceipts)(root)).filter(
+		candidate => candidate.collectionId === collection && sameCell(candidate.cell, cell),
+	);
+	if (existing.length > 1) fail("duplicate receipt cell");
+	return existing[0] ?? null;
+}
+
+export async function recoverCommittedRestartReceipt(
+	root: string,
+	proof: RestartProof,
+	dependencies: Pick<PersistReceiptDependencies, "loadReceipts" | "removeRestartProof"> = {},
+): Promise<Gate0Receipt | null> {
+	const existing = (await (dependencies.loadReceipts ?? loadReceipts)(root)).filter(candidate =>
+		sameCell(candidate.cell, proof.cell),
+	);
+	if (existing.length > 1) fail("duplicate receipt cell");
+	if (existing.length === 0) return null;
+	const committed = existing[0]!;
+	if (
+		committed.collectionId !== proof.collectionId ||
+		committed.artifact.sourceRevision !== proof.artifact.sourceRevision ||
+		committed.artifact.baselineSha256 !== proof.artifact.sha256 ||
+		committed.codesign.baseline.verified !== proof.codesign.verified ||
+		committed.codesign.baseline.signing !== proof.codesign.signing
+	)
+		fail("existing receipt does not match the restart proof continuation");
+	await (dependencies.removeRestartProof ?? removeRestartProof)(root, proof);
+	return committed;
+}
+
 export interface PersistReceiptDependencies {
 	writeReceipt?: (root: string, receipt: Gate0Receipt) => Promise<void>;
 	removeRestartProof?: (root: string, proof: RestartProof) => Promise<void>;
+	loadReceipts?: (root: string) => Promise<Gate0Receipt[]>;
 }
 
 export async function persistReceiptAndConsumeProof(
@@ -932,9 +1065,177 @@ export async function persistReceiptAndConsumeProof(
 	receipt: Gate0Receipt,
 	proof: RestartProof | null,
 	dependencies: PersistReceiptDependencies = {},
-): Promise<void> {
-	await (dependencies.writeReceipt ?? writeReceipt)(root, receipt);
+): Promise<Gate0Receipt> {
+	const write = dependencies.writeReceipt ?? writeReceipt;
+	if (proof) {
+		const committed = await recoverCommittedRestartReceipt(root, proof, dependencies);
+		if (committed) return committed;
+	}
+	await write(root, receipt);
 	if (proof) await (dependencies.removeRestartProof ?? removeRestartProof)(root, proof);
+	return receipt;
+}
+
+export interface RestartCellLifecycleDependencies {
+	loadProof?: typeof loadRestartProof;
+	captureHost?: typeof captureHostProcess;
+	sourceRevision?: typeof readSourceRevision;
+	codesign?: typeof codesignSummary;
+	runContinuity?: typeof runCellContinuity;
+	persist?: typeof persistReceiptAndConsumeProof;
+	recoverCommittedReceipt?: typeof recoverCommittedRestartReceipt;
+	recoverCommittedCellReceipt?: typeof recoverCommittedCellReceipt;
+	now?: () => Date;
+}
+
+export async function publishRestartRequest(
+	root: string,
+	proof: RestartProof,
+	publish: typeof writeRestartProof = writeRestartProof,
+): Promise<void> {
+	await publish(root, proof);
+}
+
+export interface RestartRequestLifecycleDependencies {
+	loadProof?: typeof loadRestartProof;
+	captureHost?: typeof captureHostProcess;
+	invoke?: typeof invokeExperiment;
+	readArtifact?: (value: string) => Promise<ReleaseArtifact>;
+	sourceRevision?: typeof readSourceRevision;
+	codesign?: typeof codesignSummary;
+	publish?: typeof publishRestartRequest;
+	now?: () => Date;
+}
+
+export async function runRestartRequestLifecycle(
+	root: string,
+	collection: string,
+	cell: Gate0Receipt["cell"],
+	artifact: ReleaseArtifact,
+	dependencies: RestartRequestLifecycleDependencies = {},
+): Promise<RestartProof> {
+	const loadProof = dependencies.loadProof ?? loadRestartProof,
+		captureHost = dependencies.captureHost ?? captureHostProcess,
+		invoke = dependencies.invoke ?? invokeExperiment,
+		readArtifact = dependencies.readArtifact ?? releaseArtifact,
+		sourceRevision = dependencies.sourceRevision ?? readSourceRevision,
+		codesign = dependencies.codesign ?? codesignSummary,
+		publish = dependencies.publish ?? publishRestartRequest,
+		now = dependencies.now ?? (() => new Date());
+	const initialSource = await sourceRevision();
+	const initialCodesign = await codesign(artifact.path);
+	if (!initialCodesign.verified || initialCodesign.signing !== "adhoc")
+		fail("release artifact must have a verified ad-hoc signature");
+	if (await loadProof(root, collection, cell)) fail("restart proof already exists for this cell");
+	const requestHost = await captureHost(cell.host);
+	const requestCode = restartRequestCode(
+		experimentResult(await invoke(artifact.path, { operation: "probe", request: true })),
+	);
+	const currentArtifact = await readArtifact(artifact.path);
+	const currentSource = await sourceRevision();
+	const currentCodesign = await codesign(currentArtifact.path);
+	if (
+		currentArtifact.sha256 !== artifact.sha256 ||
+		currentSource !== initialSource ||
+		!currentCodesign.verified ||
+		currentCodesign.signing !== "adhoc" ||
+		currentCodesign.signing !== initialCodesign.signing ||
+		currentCodesign.verified !== initialCodesign.verified
+	)
+		fail("artifact, source, or codesign state changed during restart request collection");
+	requireStableHostProcess(requestHost, await captureHost(cell.host), "restart request");
+	const proof: RestartProof = {
+		schemaVersion: 1,
+		kind: "screen-recording-restart-request",
+		gate: 0,
+		collectionId: collection,
+		cell,
+		artifact: { identity: "packages/coding-agent/dist/gjc", sourceRevision: initialSource, sha256: artifact.sha256 },
+		codesign: initialCodesign,
+		hostProcess: requestHost,
+		requestedAt: now().toISOString(),
+		request: { attempted: true, code: requestCode },
+	};
+	await publish(root, proof);
+	return proof;
+}
+
+export async function runRestartCellLifecycle(
+	root: string,
+	collection: string,
+	cell: Gate0Receipt["cell"],
+	artifact: ReleaseArtifact,
+	dependencies: RestartCellLifecycleDependencies = {},
+): Promise<Gate0Receipt> {
+	const loadProof = dependencies.loadProof ?? loadRestartProof,
+		captureHost = dependencies.captureHost ?? captureHostProcess,
+		sourceRevision = dependencies.sourceRevision ?? readSourceRevision,
+		codesign = dependencies.codesign ?? codesignSummary,
+		runContinuity = dependencies.runContinuity ?? runCellContinuity,
+		persist = dependencies.persist ?? persistReceiptAndConsumeProof,
+		recoverCommittedReceipt = dependencies.recoverCommittedReceipt ?? recoverCommittedRestartReceipt,
+		recoverCommittedCell = dependencies.recoverCommittedCellReceipt ?? recoverCommittedCellReceipt,
+		now = dependencies.now ?? (() => new Date());
+	const startedAt = now().toISOString();
+	const proof = await loadProof(root, collection, cell);
+	let restartHost: HostProcessIdentity | null = null;
+	if (proof) {
+		const committed = await recoverCommittedReceipt(root, proof);
+		if (committed) return committed;
+		restartHost = await captureHost(cell.host);
+		requireRestartedHostProcess(proof, restartHost);
+		const currentSource = await sourceRevision();
+		const currentCodesign = await codesign(artifact.path);
+		if (
+			proof.artifact.sourceRevision !== currentSource ||
+			proof.artifact.sha256 !== artifact.sha256 ||
+			!validCodeSign(currentCodesign) ||
+			currentCodesign.signing !== proof.codesign.signing ||
+			currentCodesign.verified !== proof.codesign.verified
+		)
+			fail("restart proof does not match the current artifact, source, or codesign state");
+	} else {
+		const committed = await recoverCommittedCell(root, collection, cell);
+		if (committed) return committed;
+	}
+	const continuity = await runContinuity(
+		artifact,
+		cell.topology,
+		{},
+		{
+			baselineRequest: !proof,
+			expectedBaseline: proof ? { sha256: proof.artifact.sha256, codesign: proof.codesign } : undefined,
+		},
+	);
+	if (proof) requireRestartProofContinuity(proof, continuity);
+	if (!proof && !continuity.baselinePair.probe.requestAttempted)
+		fail("baseline did not exercise the explicit Screen Recording request");
+	const receipt: Gate0Receipt = {
+		schemaVersion: 1,
+		gate: 0,
+		collectionId: collection,
+		cell,
+		artifact: {
+			identity: "packages/coding-agent/dist/gjc",
+			sourceRevision: continuity.sourceRevision,
+			baselineSha256: continuity.baseline.sha256,
+			updatedSha256: continuity.updated.sha256,
+		},
+		codesign: { baseline: continuity.baselineCodesign, updated: continuity.updatedCodesign, compatible: true },
+		continuity: { baselineSuccess: true, updatedSuccess: true },
+		timestamps: { startedAt, completedAt: now().toISOString() },
+		permissions: {
+			screenRecordingGranted: continuity.updatedPair.lifecycle.permission.screenRecording,
+			accessibilityGranted: continuity.updatedPair.lifecycle.permission.accessibility,
+			requestAttempted: proof ? true : continuity.baselinePair.probe.requestAttempted,
+		},
+		ancestry: continuity.updatedPair.lifecycle.ancestry,
+		lifecycle: { markers: continuity.updatedPair.lifecycle.lifecycle },
+		result: { success: true, code: "ok" },
+	};
+	if (proof && restartHost)
+		requireStableHostProcess(restartHost, await captureHost(cell.host), "post-restart continuity");
+	return persist(root, receipt, proof);
 }
 
 async function requestCell(args: string[]): Promise<void> {
@@ -946,45 +1247,7 @@ async function requestCell(args: string[]): Promise<void> {
 	const releaseLock = await acquireExperimentLock(root);
 	try {
 		const artifact = await releaseArtifact(requireFlag(args, "artifact"));
-		const sourceRevision = await readSourceRevision();
-		const codesign = await codesignSummary(artifact.path);
-		if (!codesign.verified || codesign.signing !== "adhoc")
-			fail("release artifact must have a verified ad-hoc signature");
-		const existing = await loadRestartProof(root, collection, cell);
-		if (existing) fail("restart proof already exists for this cell");
-		const requestHost = await captureHostProcess(cell.host);
-
-		const result = experimentResult(await invokeExperiment(artifact.path, { operation: "probe", request: true }));
-		const requestCode = restartRequestCode(result);
-		const currentArtifact = await releaseArtifact(artifact.path);
-		const currentSource = await readSourceRevision();
-		const currentCodesign = await codesignSummary(currentArtifact.path);
-		if (
-			currentArtifact.sha256 !== artifact.sha256 ||
-			currentSource !== sourceRevision ||
-			!currentCodesign.verified ||
-			currentCodesign.signing !== "adhoc" ||
-			currentCodesign.signing !== codesign.signing ||
-			currentCodesign.verified !== codesign.verified
-		)
-			fail("artifact, source, or codesign state changed during restart request collection");
-		const postRequestHost = await captureHostProcess(cell.host);
-		requireStableHostProcess(requestHost, postRequestHost, "restart request");
-
-		const proof: RestartProof = {
-			schemaVersion: 1,
-			kind: "screen-recording-restart-request",
-			gate: 0,
-			collectionId: collection,
-			cell,
-			artifact: { identity: "packages/coding-agent/dist/gjc", sourceRevision, sha256: artifact.sha256 },
-			codesign,
-			hostProcess: requestHost,
-
-			requestedAt: new Date().toISOString(),
-			request: { attempted: true, code: requestCode },
-		};
-		await writeRestartProof(root, proof);
+		await runRestartRequestLifecycle(root, collection, cell, artifact);
 		process.stdout.write(`${canonicalJson({ gate: 0, cell, restartRequired: true } as JsonValue)}\n`);
 	} finally {
 		await releaseLock();
@@ -999,57 +1262,8 @@ async function runCell(args: string[]): Promise<void> {
 	await ensureEvidenceRoot(root);
 	const releaseLock = await acquireExperimentLock(root);
 	try {
-		const startedAt = new Date().toISOString(),
-			artifact = await releaseArtifact(requireFlag(args, "artifact"));
-		const proof = await loadRestartProof(root, collection, cell);
-		let restartHost: HostProcessIdentity | null = null;
-		if (proof) {
-			restartHost = await captureHostProcess(cell.host);
-			requireRestartedHostProcess(proof.hostProcess, restartHost);
-
-			const sourceRevision = await readSourceRevision();
-			const codesign = await codesignSummary(artifact.path);
-			if (
-				proof.artifact.sourceRevision !== sourceRevision ||
-				proof.artifact.sha256 !== artifact.sha256 ||
-				!validCodeSign(codesign) ||
-				codesign.signing !== proof.codesign.signing ||
-				codesign.verified !== proof.codesign.verified
-			)
-				fail("restart proof does not match the current artifact, source, or codesign state");
-		}
-		const continuity = await runCellContinuity(artifact, cell.topology, {}, !proof);
-		if (proof) requireRestartProofContinuity(proof, continuity);
-		if (!proof && !continuity.baselinePair.probe.requestAttempted)
-			fail("baseline did not exercise the explicit Screen Recording request");
-		const receipt: Gate0Receipt = {
-			schemaVersion: 1,
-			gate: 0,
-			collectionId: collection,
-			cell,
-			artifact: {
-				identity: "packages/coding-agent/dist/gjc",
-				sourceRevision: continuity.sourceRevision,
-				baselineSha256: continuity.baseline.sha256,
-				updatedSha256: continuity.updated.sha256,
-			},
-			codesign: { baseline: continuity.baselineCodesign, updated: continuity.updatedCodesign, compatible: true },
-			continuity: { baselineSuccess: true, updatedSuccess: true },
-			timestamps: { startedAt, completedAt: new Date().toISOString() },
-			permissions: {
-				screenRecordingGranted: continuity.updatedPair.lifecycle.permission.screenRecording,
-				accessibilityGranted: continuity.updatedPair.lifecycle.permission.accessibility,
-				requestAttempted: proof ? true : continuity.baselinePair.probe.requestAttempted,
-			},
-			ancestry: continuity.updatedPair.lifecycle.ancestry,
-			lifecycle: { markers: continuity.updatedPair.lifecycle.lifecycle },
-			result: { success: true, code: "ok" },
-		};
-		if (proof && restartHost) {
-			requireStableHostProcess(restartHost, await captureHostProcess(cell.host), "post-restart continuity");
-		}
-
-		await persistReceiptAndConsumeProof(root, receipt, proof);
+		const artifact = await releaseArtifact(requireFlag(args, "artifact"));
+		const receipt = await runRestartCellLifecycle(root, collection, cell, artifact);
 		process.stdout.write(`${canonicalJson({ gate: 0, cell, result: receipt.result } as JsonValue)}\n`);
 	} finally {
 		await releaseLock();
@@ -1065,7 +1279,7 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
 function validHostProcess(value: unknown): value is HostProcessIdentity {
 	return (
 		isRecord(value) &&
-		hasExactKeys(value, ["executableSha256", "host", "pid", "startTokenSha256"]) &&
+		hasExactKeys(value, ["executableSha256", "host", "pid", "startTokenSha256", "startedAtMs"]) &&
 		HOST_VALUES.has(value.host as Host) &&
 		typeof value.pid === "number" &&
 		Number.isSafeInteger(value.pid) &&
@@ -1073,7 +1287,10 @@ function validHostProcess(value: unknown): value is HostProcessIdentity {
 		typeof value.executableSha256 === "string" &&
 		/^[a-f0-9]{64}$/.test(value.executableSha256) &&
 		typeof value.startTokenSha256 === "string" &&
-		/^[a-f0-9]{64}$/.test(value.startTokenSha256)
+		/^[a-f0-9]{64}$/.test(value.startTokenSha256) &&
+		typeof value.startedAtMs === "number" &&
+		Number.isSafeInteger(value.startedAtMs) &&
+		value.startedAtMs > 0
 	);
 }
 

@@ -17,6 +17,8 @@ import {
 	loadReceiptSigner,
 	loadRestartProof,
 	persistReceiptAndConsumeProof,
+	publishDurableSignedRecord,
+	publishRestartRequest,
 	type RestartProof,
 	readSourceRevision,
 	releaseArtifact,
@@ -30,6 +32,8 @@ import {
 	runBoundedCommand,
 	runCellContinuity,
 	runCellExperimentPair,
+	runRestartCellLifecycle,
+	runRestartRequestLifecycle,
 	validRestartProof,
 	writeRestartProof,
 } from "../../scripts/computer-broker-live-e2e";
@@ -127,6 +131,7 @@ function restartProof(overrides: Partial<RestartProof> = {}): RestartProof {
 			pid: 42,
 			executableSha256: "c".repeat(64),
 			startTokenSha256: "d".repeat(64),
+			startedAtMs: Date.parse("Tue Jul 17 09:00:00 2026"),
 		},
 
 		...overrides,
@@ -856,6 +861,7 @@ describe("computer broker Gate-0 receipt runner", () => {
 		const pending = experiment("probe", false);
 		pending.code = "permission_pending";
 		pending.requestAttempted = true;
+
 		const result = await runCellContinuity({ path: "baseline", sha256: BASELINE_SHA }, "A2", {
 			build: async () => {},
 			readArtifact: async () => ({ path: "updated", sha256: UPDATED_SHA }),
@@ -865,6 +871,43 @@ describe("computer broker Gate-0 receipt runner", () => {
 		});
 		expect(result.baselinePair.probe.code).toBe("permission_pending");
 		expect(result.updatedPair.probe.requestAttempted).toBe(false);
+	});
+
+	it("re-attests the signed baseline artifact immediately before and after staged execution", async () => {
+		const proof = restartProof();
+		let artifactReads = 0;
+		await expect(
+			runCellContinuity(
+				{ path: "baseline", sha256: BASELINE_SHA },
+				"A1",
+				{
+					build: async () => {},
+					readArtifact: async () => ({
+						path: "baseline",
+						sha256: artifactReads++ === 0 ? BASELINE_SHA : "f".repeat(64),
+					}),
+					codesign: async () => ({ verified: true, signing: "adhoc" }),
+					sourceRevision: async () => REVISION,
+					runPair: async () => successfulPair("A1"),
+				},
+				{ baselineRequest: false, expectedBaseline: { sha256: proof.artifact.sha256, codesign: proof.codesign } },
+			),
+		).rejects.toThrow("baseline release artifact changed after execution");
+		let signChecks = 0;
+		await expect(
+			runCellContinuity(
+				{ path: "baseline", sha256: BASELINE_SHA },
+				"A1",
+				{
+					build: async () => {},
+					readArtifact: async () => ({ path: "baseline", sha256: BASELINE_SHA }),
+					codesign: async () => ({ verified: ++signChecks === 1, signing: "adhoc" }),
+					sourceRevision: async () => REVISION,
+					runPair: async () => successfulPair("A1"),
+				},
+				{ baselineRequest: false, expectedBaseline: { sha256: proof.artifact.sha256, codesign: proof.codesign } },
+			),
+		).rejects.toThrow("baseline release artifact changed after execution");
 	});
 
 	it("rejects dirty source inputs while allowing only Ultragoal state", async () => {
@@ -1141,6 +1184,324 @@ describe("computer broker Gate-0 receipt runner", () => {
 		expect((await fs.readdir(path.join(root, "receipts"))).length).toBe(1);
 	});
 
+	it("cleans temporary publication files after write and commit failures without overwriting final records", async () => {
+		const root = await evidenceRoot();
+		const destination = path.join(root, "request-proofs", "durable.json");
+		for (const stage of ["write", "commit"] as const) {
+			const temporary = `${destination}.${stage}.tmp`;
+			await expect(
+				publishDurableSignedRecord(destination, "signed\n", {
+					temporary,
+					writeTemporary: async (target, contents) => {
+						await fs.writeFile(target, contents, { flag: "wx", mode: 0o600 });
+						if (stage === "write") throw new Error("write failed");
+					},
+					commit: async (target, final) => {
+						if (stage === "commit") throw new Error("commit failed");
+						await fs.link(target, final);
+					},
+				}),
+			).rejects.toThrow(`${stage} failed`);
+			await expect(fs.lstat(temporary)).rejects.toMatchObject({ code: "ENOENT" });
+		}
+		await publishDurableSignedRecord(destination, "signed\n");
+		await expect(publishDurableSignedRecord(destination, "replacement\n")).rejects.toMatchObject({ code: "EEXIST" });
+		expect(await fs.readFile(destination, "utf8")).toBe("signed\n");
+	});
+
+	it("consumes a proof on retry after receipt commit succeeds but unlink fails", async () => {
+		const root = await evidenceRoot();
+		const proof = restartProof();
+		const receipt = cell("A1", "26", "ghostty");
+		const proofPath = path.join(root, "request-proofs", restartProofFile(COLLECTION_ID, proof.cell));
+		await writeRestartProof(root, proof);
+		await expect(
+			persistReceiptAndConsumeProof(root, receipt, proof, {
+				removeRestartProof: async () => {
+					throw new Error("unlink failed");
+				},
+			}),
+		).rejects.toThrow("unlink failed");
+		expect((await fs.readdir(path.join(root, "receipts"))).length).toBe(1);
+		const recovered = await persistReceiptAndConsumeProof(
+			root,
+			{ ...receipt, timestamps: { startedAt: new Date().toISOString(), completedAt: new Date().toISOString() } },
+			proof,
+		);
+		expect(recovered).toEqual(receipt);
+		await expect(fs.lstat(proofPath)).rejects.toMatchObject({ code: "ENOENT" });
+		expect((await fs.readdir(path.join(root, "receipts"))).length).toBe(1);
+	});
+
+	it("drives signed restart proof publication through the resumed lifecycle and preserves proof at every failure boundary", async () => {
+		const root = await evidenceRoot();
+		const staged = restartProof({
+			requestedAt: new Date(Date.now() - 1_000).toISOString(),
+			hostProcess: { ...restartProof().hostProcess, startedAtMs: Date.now() - 2_000 },
+		});
+		const artifact = { path: "baseline", sha256: BASELINE_SHA };
+		const continuity = {
+			sourceRevision: REVISION,
+			baseline: artifact,
+			updated: { path: "updated", sha256: UPDATED_SHA },
+			baselineCodesign: { verified: true as const, signing: "adhoc" as const },
+			updatedCodesign: { verified: true as const, signing: "adhoc" as const },
+			baselinePair: successfulPair("A1"),
+			updatedPair: successfulPair("A1"),
+		};
+		const proofPath = path.join(root, "request-proofs", restartProofFile(COLLECTION_ID, staged.cell));
+		const restartedHost = {
+			...staged.hostProcess,
+			pid: staged.hostProcess.pid + 1,
+			startTokenSha256: "e".repeat(64),
+			startedAtMs: Date.now(),
+		};
+		const lifecycle = (overrides: Parameters<typeof runRestartCellLifecycle>[4] = {}) =>
+			runRestartCellLifecycle(root, COLLECTION_ID, staged.cell, artifact, {
+				captureHost: async () => restartedHost,
+				sourceRevision: async () => REVISION,
+				codesign: async () => ({ verified: true, signing: "adhoc" }),
+				runContinuity: async () => continuity,
+				...overrides,
+			});
+
+		await publishRestartRequest(root, staged);
+		await expect(lifecycle({ captureHost: async () => staged.hostProcess })).rejects.toThrow(
+			"does not prove a terminal host process restart",
+		);
+		expect((await fs.lstat(proofPath)).isFile()).toBe(true);
+		await expect(
+			lifecycle({
+				runContinuity: async () => {
+					throw new Error("baseline failed");
+				},
+			}),
+		).rejects.toThrow("baseline failed");
+		expect((await fs.lstat(proofPath)).isFile()).toBe(true);
+		await expect(
+			lifecycle({
+				runContinuity: async () => {
+					throw new Error("re-attestation failed");
+				},
+			}),
+		).rejects.toThrow("re-attestation failed");
+		expect((await fs.lstat(proofPath)).isFile()).toBe(true);
+		await expect(
+			lifecycle({
+				persist: async () => {
+					throw new Error("receipt commit failed");
+				},
+			}),
+		).rejects.toThrow("receipt commit failed");
+		expect((await fs.lstat(proofPath)).isFile()).toBe(true);
+
+		const order: string[] = [];
+		const receipt = await lifecycle({
+			runContinuity: async () => {
+				order.push("continuity");
+				return continuity;
+			},
+			persist: async (evidenceRoot, value, proof) => {
+				order.push("receipt");
+				const committed = await persistReceiptAndConsumeProof(evidenceRoot, value, proof);
+				order.push("proof-deleted");
+				return committed;
+			},
+		});
+		expect(order).toEqual(["continuity", "receipt", "proof-deleted"]);
+		expect(receipt.cell).toEqual(staged.cell);
+		await expect(fs.lstat(proofPath)).rejects.toMatchObject({ code: "ENOENT" });
+		expect((await fs.readdir(path.join(root, "receipts"))).length).toBe(1);
+		const responseLossRecovered = await runRestartCellLifecycle(
+			root,
+			COLLECTION_ID,
+			staged.cell,
+			continuity.updated,
+			{
+				captureHost: async () => {
+					throw new Error("host validation must not rerun after receipt commit");
+				},
+				sourceRevision: async () => {
+					throw new Error("source validation must not rerun after receipt commit");
+				},
+				codesign: async () => {
+					throw new Error("codesign validation must not rerun after receipt commit");
+				},
+				runContinuity: async () => {
+					throw new Error("continuity must not rerun after receipt commit");
+				},
+				persist: async () => {
+					throw new Error("receipt persistence must not rerun after receipt commit");
+				},
+			},
+		);
+		expect(responseLossRecovered).toEqual(receipt);
+		expect((await fs.readdir(path.join(root, "receipts"))).length).toBe(1);
+	});
+
+	it("runs the real request-to-restart lifecycle and recovers an A-to-B committed receipt before all resumed validation", async () => {
+		const root = await evidenceRoot();
+		const stagedCell = restartProof().cell;
+		const artifactA = { path: "artifact", sha256: BASELINE_SHA };
+		const artifactB = { path: "artifact", sha256: UPDATED_SHA };
+		const requestStartedAt = Date.now();
+		const requestHost = { ...restartProof().hostProcess, startedAtMs: requestStartedAt - 1_000 };
+		const restartedHost = {
+			...requestHost,
+			pid: requestHost.pid + 1,
+			startTokenSha256: "e".repeat(64),
+			startedAtMs: requestStartedAt + 1_000,
+		};
+		const requestProbe = experiment("probe", false);
+		requestProbe.requestAttempted = true;
+		requestProbe.code = "permission_pending";
+		requestProbe.permission = { accessibility: false, screenRecording: false };
+		const continuity = {
+			sourceRevision: REVISION,
+			baseline: artifactA,
+			updated: artifactB,
+			baselineCodesign: { verified: true as const, signing: "adhoc" as const },
+			updatedCodesign: { verified: true as const, signing: "adhoc" as const },
+			baselinePair: successfulPair("A1"),
+			updatedPair: successfulPair("A1"),
+		};
+		const order: string[] = [];
+		await expect(
+			runRestartRequestLifecycle(root, COLLECTION_ID, stagedCell, artifactA, {
+				sourceRevision: async () => REVISION,
+				codesign: async () => ({ verified: true, signing: "adhoc" }),
+				captureHost: async () => requestHost,
+				invoke: async () => requestProbe,
+				readArtifact: async () => artifactA,
+				publish: async () => {
+					throw new Error("proof publication failed");
+				},
+				now: () => new Date(requestStartedAt),
+			}),
+		).rejects.toThrow("proof publication failed");
+		await expect(
+			fs.lstat(path.join(root, "request-proofs", restartProofFile(COLLECTION_ID, stagedCell))),
+		).rejects.toMatchObject({ code: "ENOENT" });
+
+		const proof = await runRestartRequestLifecycle(root, COLLECTION_ID, stagedCell, artifactA, {
+			sourceRevision: async () => {
+				order.push("request-source");
+				return REVISION;
+			},
+			codesign: async () => {
+				order.push("request-codesign");
+				return { verified: true, signing: "adhoc" };
+			},
+			captureHost: async () => {
+				order.push("request-host");
+				return requestHost;
+			},
+			invoke: async () => {
+				order.push("request-probe");
+				return requestProbe;
+			},
+			readArtifact: async () => {
+				order.push("request-reattest-artifact");
+				return artifactA;
+			},
+			publish: async (evidenceRoot, signedProof) => {
+				order.push("proof-published");
+				await publishRestartRequest(evidenceRoot, signedProof);
+			},
+			now: () => new Date(requestStartedAt),
+		});
+		expect(proof.artifact.sha256).toBe(BASELINE_SHA);
+		const proofPath = path.join(root, "request-proofs", restartProofFile(COLLECTION_ID, stagedCell));
+		expect((await fs.lstat(proofPath)).isFile()).toBe(true);
+
+		await expect(
+			runRestartCellLifecycle(root, COLLECTION_ID, stagedCell, artifactA, {
+				captureHost: async () => requestHost,
+				sourceRevision: async () => REVISION,
+				codesign: async () => ({ verified: true, signing: "adhoc" }),
+				runContinuity: async () => continuity,
+			}),
+		).rejects.toThrow("does not prove a terminal host process restart");
+		expect((await fs.lstat(proofPath)).isFile()).toBe(true);
+		await expect(
+			runRestartCellLifecycle(root, COLLECTION_ID, stagedCell, artifactA, {
+				captureHost: async () => restartedHost,
+				sourceRevision: async () => REVISION,
+				codesign: async () => ({ verified: true, signing: "adhoc" }),
+				runContinuity: async () => {
+					throw new Error("baseline re-attestation failed");
+				},
+			}),
+		).rejects.toThrow("baseline re-attestation failed");
+		expect((await fs.lstat(proofPath)).isFile()).toBe(true);
+		await expect(
+			runRestartCellLifecycle(root, COLLECTION_ID, stagedCell, artifactA, {
+				captureHost: async () => restartedHost,
+				sourceRevision: async () => REVISION,
+				codesign: async () => ({ verified: true, signing: "adhoc" }),
+				runContinuity: async () => continuity,
+				persist: async () => {
+					throw new Error("receipt commit failed");
+				},
+			}),
+		).rejects.toThrow("receipt commit failed");
+		expect((await fs.lstat(proofPath)).isFile()).toBe(true);
+		await expect(
+			runRestartCellLifecycle(root, COLLECTION_ID, stagedCell, artifactA, {
+				captureHost: async () => restartedHost,
+				sourceRevision: async () => REVISION,
+				codesign: async () => ({ verified: true, signing: "adhoc" }),
+				runContinuity: async () => {
+					order.push("continuity-A-to-B");
+					return continuity;
+				},
+				persist: async (evidenceRoot, receipt, signedProof) => {
+					order.push("receipt-committed");
+					return persistReceiptAndConsumeProof(evidenceRoot, receipt, signedProof, {
+						removeRestartProof: async () => {
+							throw new Error("unlink failed");
+						},
+					});
+				},
+			}),
+		).rejects.toThrow("unlink failed");
+		expect((await fs.readdir(path.join(root, "receipts"))).length).toBe(1);
+		expect((await fs.lstat(proofPath)).isFile()).toBe(true);
+		let resumedContinuity = false;
+		const recovered = await runRestartCellLifecycle(root, COLLECTION_ID, stagedCell, artifactB, {
+			captureHost: async () => {
+				throw new Error("host validation must not run during recovery");
+			},
+			sourceRevision: async () => {
+				throw new Error("source validation must not run during recovery");
+			},
+			codesign: async () => {
+				throw new Error("codesign validation must not run during recovery");
+			},
+			runContinuity: async () => {
+				resumedContinuity = true;
+				throw new Error("continuity must not run during recovery");
+			},
+		});
+		expect(recovered.artifact).toMatchObject({ baselineSha256: BASELINE_SHA, updatedSha256: UPDATED_SHA });
+		expect(resumedContinuity).toBe(false);
+		await expect(fs.lstat(proofPath)).rejects.toMatchObject({ code: "ENOENT" });
+		expect((await fs.readdir(path.join(root, "receipts"))).length).toBe(1);
+		expect(order).toEqual([
+			"request-source",
+			"request-codesign",
+			"request-host",
+			"request-probe",
+			"request-reattest-artifact",
+			"request-source",
+			"request-codesign",
+			"request-host",
+			"proof-published",
+			"continuity-A-to-B",
+			"receipt-committed",
+		]);
+	});
+
 	it("runs both post-restart continuity probes without another Screen Recording request", async () => {
 		const requests: boolean[] = [];
 		await runCellContinuity(
@@ -1156,7 +1517,7 @@ describe("computer broker Gate-0 receipt runner", () => {
 					return successfulPair("A1");
 				},
 			},
-			false,
+			{ baselineRequest: false },
 		);
 		expect(requests).toEqual([false, false]);
 	});
@@ -1240,6 +1601,7 @@ describe("computer broker Gate-0 receipt runner", () => {
 				pid: 50,
 				executableSha256: createHash("sha256").update(executable).digest("hex"),
 				startTokenSha256: createHash("sha256").update("Tue Jul 17 09:00:00 2026").digest("hex"),
+				startedAtMs: Date.parse("Tue Jul 17 09:00:00 2026"),
 			});
 		}
 		await expect(
@@ -1253,20 +1615,35 @@ describe("computer broker Gate-0 receipt runner", () => {
 		).rejects.toThrow("declared terminal host is not a direct process ancestor");
 	});
 
-	it("requires a stable changed terminal-host process generation for staged continuation", () => {
+	it("requires a stable changed terminal-host process generation created after the signed request", () => {
 		const requested: HostProcessIdentity = {
 			host: "ghostty",
 			pid: 42,
 			executableSha256: "c".repeat(64),
 			startTokenSha256: "d".repeat(64),
+			startedAtMs: Date.parse("2026-07-17T09:00:00.000Z"),
 		};
-		expect(() => requireRestartedHostProcess(requested, requested)).toThrow(
+		const proof = restartProof({ hostProcess: requested, requestedAt: "2026-07-17T10:00:00.000Z" });
+		expect(() => requireRestartedHostProcess(proof, requested)).toThrow(
 			"does not prove a terminal host process restart",
 		);
 		expect(() =>
-			requireRestartedHostProcess(requested, { ...requested, startTokenSha256: "e".repeat(64) }),
+			requireRestartedHostProcess(proof, {
+				...requested,
+				pid: 43,
+				startTokenSha256: "e".repeat(64),
+				startedAtMs: Date.parse("2026-07-17T09:30:00.000Z"),
+			}),
+		).toThrow("does not prove a terminal host process restart after the signed request");
+		expect(() =>
+			requireRestartedHostProcess(proof, {
+				...requested,
+				pid: 43,
+				startTokenSha256: "e".repeat(64),
+				startedAtMs: Date.parse("2026-07-17T10:00:01.000Z"),
+			}),
 		).not.toThrow();
-		expect(() => requireRestartedHostProcess(requested, { ...requested, executableSha256: "f".repeat(64) })).toThrow(
+		expect(() => requireRestartedHostProcess(proof, { ...requested, executableSha256: "f".repeat(64) })).toThrow(
 			"does not match the current terminal host executable",
 		);
 		expect(() => requireStableHostProcess(requested, { ...requested, pid: 43 }, "restart request")).toThrow(
