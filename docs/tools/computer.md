@@ -71,6 +71,7 @@ Stable computer error codes include:
 - `COMPUTER_CANCELLED`
 - `COMPUTER_TIMEOUT` — the local action, broker lease, or broker request exceeded the shared bounded deadline. Expired queued work is rejected before late dispatch; side-effecting input already dispatched is awaited to terminal settlement before timeout is reported.
 - `COMPUTER_BROKER_UNAVAILABLE` — the required packaged owner could not be started, claimed, or reached; a managed session never falls back to an inner native controller.
+- `COMPUTER_OBSERVATION_INCOMPLETE` — the input completed, but its requested or automatic screenshot/storage follow-up failed; do not retry the input automatically.
 - `COMPUTER_AUDIT_UNAVAILABLE` — the enabled audit sink could not be prepared, so no computer action was performed.
 - `COMPUTER_AUDIT_INCOMPLETE` — the action may already have completed but its audit record could not be appended; do not retry automatically.
 

@@ -18,6 +18,7 @@ import {
 	isComputerCallable,
 	isComputerLoadablePlatform,
 	setComputerArchForTests,
+	setComputerAuditPreparationForTests,
 	setComputerControllerFactoryForTests,
 	setComputerPlatformForTests,
 	type ToolSession,
@@ -211,6 +212,7 @@ describe("computer tool gating", () => {
 		setComputerControllerFactoryForTests(undefined);
 		setComputerPlatformForTests(undefined);
 		setComputerArchForTests(undefined);
+		setComputerAuditPreparationForTests(undefined);
 	});
 
 	it("selects the broker controller and initializes its ownership lease during tool creation", async () => {
@@ -469,6 +471,7 @@ describe("computer tool dispatch", () => {
 		setComputerControllerFactoryForTests(undefined);
 		setComputerPlatformForTests(undefined);
 		setComputerArchForTests(undefined);
+		setComputerAuditPreparationForTests(undefined);
 	});
 
 	it("maps snake_case model actions to native controller methods positionally", async () => {
@@ -597,8 +600,8 @@ describe("computer tool dispatch", () => {
 		});
 
 		expect(result.isError).toBe(true);
-		expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
-		expect(textOf(result)).toContain("Computer control is unavailable.");
+		expect(result.details?.code).toBe("COMPUTER_OBSERVATION_INCOMPLETE");
+		expect(textOf(result)).toContain("Do not retry automatically");
 		expect(calls).toEqual(["click"]);
 	});
 
@@ -621,10 +624,11 @@ describe("computer tool dispatch", () => {
 		});
 
 		expect(result.isError).toBe(true);
-		expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
+		expect(result.details?.code).toBe("COMPUTER_OBSERVATION_INCOMPLETE");
 		expect(result.details?.steps).toHaveLength(1);
-		expect(result.details?.steps?.[0]?.code).toBe("COMPUTER_UNAVAILABLE");
-		expect(textOf(result)).toContain("Computer control is unavailable.");
+		expect(result.details?.steps?.[0]?.status).toBe("success");
+		expect(result.details?.steps?.[0]?.code).toBe("COMPUTER_OBSERVATION_INCOMPLETE");
+		expect(textOf(result)).toContain("Do not retry automatically");
 		expect(calls).toEqual(["click"]);
 	});
 
@@ -1043,6 +1047,201 @@ describe("computer tool dispatch", () => {
 		expect(result.isError).toBe(true);
 		expect(result.details?.code).toBe("COMPUTER_TIMEOUT");
 		expect(calls).toEqual(["type-start", "type-end"]);
+	});
+
+	it("keeps the winning timeout when dispatched input rejects after settling", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		setComputerControllerFactoryForTests(() => ({
+			type: async () => {
+				await sleep(1_050);
+				throw new Error("late rejection");
+			},
+		}));
+		const result = await new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true }))).execute(
+			"timeout-reject",
+			{ action: "type", text: "secret", timeout: 1 },
+		);
+		expect(result.details?.code).toBe("COMPUTER_TIMEOUT");
+	});
+
+	it("keeps the winning abort when dispatched input rejects after settling", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		setComputerControllerFactoryForTests(() => ({
+			type: async () => {
+				await sleep(30);
+				throw new Error("late rejection");
+			},
+		}));
+		const abort = new AbortController();
+		const execution = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true }))).execute(
+			"abort-reject",
+			{ action: "type", text: "secret" },
+			abort.signal,
+		);
+		setTimeout(() => abort.abort(), 5);
+		await expect(execution).rejects.toThrow("Operation aborted");
+	});
+
+	it("expires same-session queued work before it can dispatch", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			type: async () => {
+				calls.push("type");
+				await sleep(1_050);
+			},
+			click: () => {
+				calls.push("click");
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const first = tool.execute("queue-first", { action: "type", text: "secret" });
+		const second = tool.execute("queue-second", { action: "click", x: 1, y: 2, timeout: 1 });
+		await first;
+		const result = await second;
+		expect(result.details?.code).toBe("COMPUTER_TIMEOUT");
+		expect(calls).toEqual(["type"]);
+	});
+
+	it("returns structured batch timeout with settled step evidence and no later dispatch", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			type: async () => {
+				calls.push("type");
+				await sleep(1_050);
+			},
+			click: () => {
+				calls.push("click");
+			},
+		}));
+		const result = await new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true }))).execute(
+			"batch-timeout",
+			{
+				action: "batch",
+				actions: [
+					{ action: "type", text: "secret", timeout: 1 },
+					{ action: "click", x: 1, y: 2 },
+				],
+			},
+		);
+		expect(result.details?.code).toBe("COMPUTER_TIMEOUT");
+		expect(result.details?.steps).toEqual([
+			expect.objectContaining({ action: "type", status: "success", code: "COMPUTER_TIMEOUT" }),
+		]);
+		expect(calls).toEqual(["type"]);
+	});
+
+	it("reports final batch screenshot timeout and abort as incomplete observation after input", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		for (const phase of ["timeout", "abort"] as const) {
+			const calls: string[] = [];
+			setComputerControllerFactoryForTests(() => ({
+				click: () => {
+					calls.push("click");
+				},
+				screenshot: async () => {
+					calls.push("screenshot");
+					await sleep(phase === "timeout" ? 1_050 : 50);
+					return { png: new Uint8Array([1, 2, 3]), widthPx: 10, heightPx: 10 };
+				},
+			}));
+			const abort = phase === "abort" ? new AbortController() : undefined;
+			const execution = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true }))).execute(
+				`batch-observation-${phase}`,
+				{
+					action: "batch",
+					actions: [{ action: "click", x: 1, y: 2 }],
+					include_screenshot: true,
+					timeout: phase === "timeout" ? 1 : undefined,
+				},
+				abort?.signal,
+			);
+			if (abort) setTimeout(() => abort.abort(), 5);
+			const result = await execution;
+			expect(result.details?.code).toBe("COMPUTER_OBSERVATION_INCOMPLETE");
+			expect(result.details?.steps).toEqual([expect.objectContaining({ action: "click", status: "success" })]);
+			expect(textOf(result)).toContain("Do not retry automatically");
+			expect(calls).toEqual(["click", "screenshot"]);
+		}
+	});
+
+	it("lets the admission deadline win while audit preparation is pending", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "computer-audit-deadline-"));
+		let calls = 0;
+		setComputerAuditPreparationForTests(async () => {
+			await sleep(1_050);
+			throw new Error("late audit preparation rejection");
+		});
+		setComputerControllerFactoryForTests(() => ({
+			click: () => {
+				calls++;
+			},
+		}));
+		try {
+			const result = await new ComputerTool(
+				createSession(
+					Settings.isolated({ "computer.enabled": true, "computer.auditLog.enabled": true }),
+					path.join(tmpDir, "session.jsonl"),
+				),
+			).execute("audit-deadline", { action: "click", x: 1, y: 2, timeout: 1 });
+			expect(result.details?.code).toBe("COMPUTER_TIMEOUT");
+			expect(calls).toBe(0);
+			await sleep(75);
+		} finally {
+			setComputerAuditPreparationForTests(undefined);
+			await fs.rm(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("audits completed batch steps when abort settles a dispatched input", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "computer-abort-audit-"));
+		const sessionFile = path.join(tmpDir, "session.jsonl");
+		try {
+			setComputerControllerFactoryForTests(() => ({
+				click: () => undefined,
+				type: async () => await sleep(40),
+			}));
+			const abort = new AbortController();
+			const execution = new ComputerTool(
+				createSession(
+					Settings.isolated({ "computer.enabled": true, "computer.auditLog.enabled": true }),
+					sessionFile,
+				),
+			).execute(
+				"abort-audit",
+				{
+					action: "batch",
+					actions: [
+						{ action: "click", x: 1, y: 2 },
+						{ action: "type", text: "secret" },
+					],
+				},
+				abort.signal,
+			);
+			setTimeout(() => abort.abort(), 5);
+			await expect(execution).rejects.toThrow("Operation aborted");
+			const records = (await fs.readFile(path.join(tmpDir, ".computer-audit.jsonl"), "utf8"))
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as Record<string, unknown>);
+			expect(records).toEqual([
+				expect.objectContaining({ action: "click", status: "success" }),
+				expect.objectContaining({ action: "type", status: "success" }),
+				expect.objectContaining({ action: "batch", status: "error", code: "COMPUTER_CANCELLED" }),
+			]);
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true });
+		}
 	});
 
 	it("honors abort signals between batch steps", async () => {

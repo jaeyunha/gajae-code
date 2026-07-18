@@ -949,7 +949,7 @@ function processAlive(pid: number): boolean {
 	}
 	if (process.platform !== "win32") {
 		const state = childProcess.spawnSync("/bin/ps", ["-o", "state=", "-p", String(pid)], { encoding: "utf8" });
-		if (state.status !== 0 || state.stdout.trim() === "Z") return false;
+		if (state.status !== 0 || state.stdout.trim().startsWith("Z")) return false;
 	}
 	return true;
 }

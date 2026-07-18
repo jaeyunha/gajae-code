@@ -168,7 +168,8 @@ describe.serial("computer broker", () => {
 				env: {},
 				isCompiledBinary: () => true,
 				startupTimeoutMs: 3_000,
-				spawn: () => childProcess.spawn(process.execPath, ["-e", "process.exit(1)"], { stdio: "ignore" }),
+				spawn: (_command, _args, options) =>
+					childProcess.spawn(process.execPath, ["-e", "process.exit(1)"], options),
 			}),
 		).toBeNull();
 		expect(Date.now() - startedAt).toBeLessThan(1_000);

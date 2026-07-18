@@ -146,6 +146,7 @@ type NativeScreenshot = {
 export type ComputerControllerFactory = () => ComputerControllerLike;
 
 export const COMPUTER_DISABLED_CODE = "COMPUTER_DISABLED";
+export const COMPUTER_OBSERVATION_INCOMPLETE_CODE = "COMPUTER_OBSERVATION_INCOMPLETE";
 
 const PUBLIC_COMPUTER_ERROR_CODES = new Set([
 	"COMPUTER_UNAVAILABLE",
@@ -156,6 +157,8 @@ const PUBLIC_COMPUTER_ERROR_CODES = new Set([
 	"COMPUTER_COORD_INVALID",
 	"COMPUTER_CANCELLED",
 	"COMPUTER_TIMEOUT",
+	COMPUTER_OBSERVATION_INCOMPLETE_CODE,
+
 	COMPUTER_DISABLED_CODE,
 ]);
 
@@ -168,6 +171,9 @@ const PUBLIC_COMPUTER_REASONS: Record<string, string> = {
 	COMPUTER_COORD_INVALID: "Coordinates are invalid for the current display.",
 	COMPUTER_CANCELLED: "Computer action was cancelled.",
 	COMPUTER_TIMEOUT: "Computer action timed out.",
+	COMPUTER_OBSERVATION_INCOMPLETE:
+		"The computer input completed, but its requested observation is incomplete. Do not retry automatically.",
+
 	COMPUTER_DISABLED: "The computer tool is disabled or unsupported.",
 };
 
@@ -210,6 +216,13 @@ const COMPUTER_INLINE_SCREENSHOT_MAX_HEIGHT = 1568;
 const COMPUTER_INLINE_SCREENSHOT_PROVIDER_MAX_BYTES = 5 * 1024 * 1024;
 const COMPUTER_INLINE_SCREENSHOT_JPEG_QUALITY = 70;
 
+let computerAuditPreparationForTests: ((session: ToolSession) => Promise<void>) | undefined;
+
+export function setComputerAuditPreparationForTests(
+	preparation: ((session: ToolSession) => Promise<void>) | undefined,
+): void {
+	computerAuditPreparationForTests = preparation;
+}
 export function setComputerControllerFactoryForTests(factory: ComputerControllerFactory | undefined): void {
 	controllerFactory = factory ?? createNativeComputerController;
 }
@@ -290,11 +303,18 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 		_onUpdate?: AgentToolUpdateCallback<ComputerToolDetails>,
 		_ctx?: AgentToolContext,
 	): Promise<AgentToolResult<ComputerToolDetails>> {
-		return serializeComputerTransaction(this.session, () => this.#executeTransaction(params, signal));
+		const timeoutSeconds = clampTimeout("computer", params.timeout);
+		const timeoutMs = timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
+		const deadline = createComputerDeadline(timeoutMs);
+		return serializeComputerTransaction(this.session, () =>
+			this.#executeTransaction(params, timeoutMs, deadline, signal),
+		);
 	}
 
 	async #executeTransaction(
 		params: ComputerParams,
+		timeoutMs: number | undefined,
+		deadline: ComputerDeadline | undefined,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<ComputerToolDetails>> {
 		const details = detailsFromParams(params);
@@ -317,11 +337,10 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 
 		try {
 			throwIfAborted(signal);
-			await prepareComputerAuditLog(this.session);
-			const timeoutSeconds = clampTimeout("computer", params.timeout);
-			const timeoutMs = timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
+			assertComputerDeadline(deadline);
+			await runComputerOperation(() => prepareComputerAuditLog(this.session), deadline, signal);
+			assertComputerDeadline(deadline);
 			const controller = controllerFactory();
-			const deadline = createComputerDeadline(timeoutMs);
 			dispatchStarted = true;
 			if (params.action === "batch") {
 				const batchResult = await dispatchBatchComputerActions(
@@ -334,6 +353,7 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 					Boolean(this.session.settings.get("computer.autoScreenshot")),
 					signal,
 					deadline,
+					this.session,
 				);
 				details.steps = batchResult.steps;
 				if (batchResult.screenshot) {
@@ -344,9 +364,7 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 				if (batchResult.failedStep) {
 					details.code = batchResult.failedStep.code;
 					details.message = batchResult.failedStep.message;
-					if (batchResult.screenshotSource !== undefined) {
-						await persistScreenshotFallback(batchResult.screenshotSource, details.screenshot, this.session);
-					}
+
 					await writeComputerAuditLog(this.session, details);
 					return {
 						...toolResult(details).text(`${details.code}: ${details.message}`).done(),
@@ -354,10 +372,6 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 					};
 				}
 				details.message = describeComputerSuccess(details);
-				if (batchResult.screenshotSource !== undefined) {
-					await persistScreenshotFallback(batchResult.screenshotSource, details.screenshot, this.session);
-					details.message = describeComputerSuccess(details);
-				}
 				const image = await inlineImageContentFromNativeResult(batchResult.screenshotSource, details, this.session);
 				await writeComputerAuditLog(this.session, details);
 				return image
@@ -366,35 +380,49 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 							.done()
 					: toolResult(details).text(details.message).done();
 			}
-			let result = await dispatchComputerAction(
+			const singleResult = await dispatchStructuredComputerAction(
 				controller,
 				params,
 				deadline,
 				latestScreenshotContexts.get(this.session),
+				shouldCapturePostActionScreenshot(params, this.session),
 				signal,
+				this.session,
 			);
-			if (shouldCapturePostActionScreenshot(params, this.session)) {
-				result = await captureScreenshot(controller, deadline, signal);
+			Object.assign(details, singleResult.details);
+			if (singleResult.screenshot) rememberLatestScreenshot(this.session, singleResult.screenshot);
+			if (singleResult.observationIncomplete) {
+				await writeComputerAuditLog(this.session, details);
+				return { ...toolResult(details).text(`${details.code}: ${details.message}`).done(), isError: true };
 			}
-			const screenshot = normalizeScreenshot(result);
-			if (screenshot) {
-				details.screenshot = screenshot;
-				rememberLatestScreenshot(this.session, screenshot);
-			}
-			details.status = "success";
-			details.message = describeComputerSuccess(details);
-			if (screenshot) {
-				await persistScreenshotFallback(result, details.screenshot, this.session);
-				details.message = describeComputerSuccess(details);
-			}
-			const image = await inlineImageContentFromNativeResult(result, details, this.session);
+			const image = await inlineImageContentFromNativeResult(singleResult.screenshotSource, details, this.session);
 			await writeComputerAuditLog(this.session, details);
 			return image
 				? toolResult(details)
-						.content([{ type: "text", text: details.message }, image])
+						.content([{ type: "text", text: details.message ?? describeComputerSuccess(details) }, image])
 						.done()
-				: toolResult(details).text(details.message).done();
+				: toolResult(details)
+						.text(details.message ?? describeComputerSuccess(details))
+						.done();
 		} catch (error) {
+			if (error instanceof ComputerBatchGuardError) {
+				details.steps = error.steps;
+				if (error.screenshot) details.screenshot = error.screenshot;
+				const mapped = mapComputerError(error.guard, hotkey);
+				details.status = "error";
+				details.code = mapped.code;
+				details.message = mapped.message;
+				try {
+					await writeComputerAuditLog(this.session, details);
+				} catch {
+					details.code = "COMPUTER_AUDIT_INCOMPLETE";
+					details.message =
+						"Computer action may already have completed, but its audit record could not be written. Do not retry automatically.";
+					return { ...toolResult(details).text(`${details.code}: ${details.message}`).done(), isError: true };
+				}
+				if (error.guard instanceof ToolAbortError) throw error.guard;
+				return { ...toolResult(details).text(`${details.code}: ${details.message}`).done(), isError: true };
+			}
 			if (error instanceof ComputerAuditError) {
 				details.status = "error";
 				details.code =
@@ -597,7 +625,10 @@ async function runComputerOperation<T>(
 		const outcome = await (guards.length > 0 ? Promise.race([operationOutcome, ...guards]) : operationOutcome);
 		if (outcome.kind === "error") throw outcome.error;
 		if (outcome.kind === "guard") {
-			if (settleBeforeCancellation) await operationPromise;
+			if (settleBeforeCancellation) {
+				const settledOutcome = await operationOutcome;
+				Object.assign(outcome.error, { computerOperationSettled: settledOutcome });
+			}
 			throw outcome.error;
 		}
 		throwIfAborted(signal);
@@ -708,6 +739,58 @@ function dispatchComputerAction(
 	);
 }
 
+interface StructuredComputerActionResult {
+	details: ComputerToolDetails;
+	screenshot?: ComputerScreenshotDetails;
+	screenshotSource?: unknown;
+	observationIncomplete: boolean;
+}
+
+async function dispatchStructuredComputerAction(
+	controller: ComputerControllerLike,
+	params: SingleComputerParams,
+	deadline: ComputerDeadline | undefined,
+	context: ScreenshotContext | undefined,
+	includeScreenshot: boolean,
+	signal: AbortSignal | undefined,
+	session: ToolSession,
+): Promise<StructuredComputerActionResult> {
+	const details = detailsFromParams(params);
+	let screenshotSource: unknown;
+	let inputCompleted = false;
+	try {
+		screenshotSource = await dispatchComputerAction(controller, params, deadline, context, signal);
+		inputCompleted = params.action !== "screenshot";
+		if (includeScreenshot) screenshotSource = await captureScreenshot(controller, deadline, signal);
+		const screenshot = normalizeScreenshot(screenshotSource);
+		if (screenshot) {
+			details.screenshot = screenshot;
+			await persistScreenshotFallback(screenshotSource, screenshot, session, deadline);
+		}
+		details.status = "success";
+		details.message = describeComputerSuccess(details);
+		return { details, screenshot, screenshotSource, observationIncomplete: false };
+	} catch (error) {
+		if (!inputCompleted) throw error;
+		details.status = "success";
+		details.code = COMPUTER_OBSERVATION_INCOMPLETE_CODE;
+		details.message =
+			"The computer input completed, but its requested observation is incomplete. Do not retry automatically.";
+		return { details, screenshotSource, observationIncomplete: true };
+	}
+}
+
+class ComputerBatchGuardError extends Error {
+	constructor(
+		readonly guard: ToolAbortError | ComputerTimeoutError,
+		readonly steps: ComputerToolDetails[],
+		readonly screenshot?: ComputerScreenshotDetails,
+		readonly screenshotSource?: unknown,
+	) {
+		super("Computer batch was cancelled after a dispatched step.");
+	}
+}
+
 interface BatchDispatchResult {
 	steps: ComputerToolDetails[];
 	screenshot?: ComputerScreenshotDetails;
@@ -725,39 +808,69 @@ async function dispatchBatchComputerActions(
 	autoScreenshot = false,
 	signal?: AbortSignal,
 	deadline?: ComputerDeadline,
+	session?: ToolSession,
 ): Promise<BatchDispatchResult> {
 	const steps: ComputerToolDetails[] = [];
 	let lastScreenshot: ComputerScreenshotDetails | undefined;
 	let lastScreenshotSource: unknown;
 	let context = initialContext;
 	for (const single of actions) {
-		const stepDetails = detailsFromParams(single);
 		try {
 			throwIfAborted(signal);
 			assertComputerDeadline(deadline);
 			const stepTimeoutMs = stepTimeoutFromParams(single, timeoutMs);
 			const stepDeadline = createComputerDeadline(stepTimeoutMs, deadline);
-			let result = await dispatchComputerAction(controller, single, stepDeadline, context, signal);
-			if (single.action !== "screenshot" && (single.include_screenshot === true || autoScreenshot)) {
-				result = await captureScreenshot(controller, stepDeadline, signal);
+			const stepResult = await dispatchStructuredComputerAction(
+				controller,
+				single,
+				stepDeadline,
+				context,
+				single.action !== "screenshot" && (single.include_screenshot === true || autoScreenshot),
+				signal,
+				session as ToolSession,
+			);
+			steps.push(stepResult.details);
+			if (stepResult.screenshot) {
+				lastScreenshot = stepResult.screenshot;
+				lastScreenshotSource = stepResult.screenshotSource;
+				context = stepResult.screenshot;
 			}
-
-			const screenshot = normalizeScreenshot(result);
-			if (screenshot) {
-				stepDetails.screenshot = screenshot;
-				lastScreenshot = screenshot;
-				lastScreenshotSource = result;
-				context = screenshot;
+			if (stepResult.observationIncomplete) {
+				return {
+					steps,
+					screenshot: lastScreenshot,
+					screenshotSource: lastScreenshotSource,
+					failedStep: { code: stepResult.details.code!, message: stepResult.details.message! },
+				};
 			}
-			stepDetails.status = "success";
-			stepDetails.message = describeComputerSuccess(stepDetails);
 		} catch (error) {
-			if (error instanceof ToolAbortError) throw error;
 			const mapped = mapComputerError(error, hotkey);
-			stepDetails.status = mapped.code === COMPUTER_DISABLED_CODE ? "disabled" : "error";
-			stepDetails.code = mapped.code;
-			stepDetails.message = mapped.message;
-			steps.push(stepDetails);
+			const settled = (error as Error & { computerOperationSettled?: { kind: "success" | "error" } })
+				.computerOperationSettled;
+			if (
+				(error instanceof ToolAbortError || error instanceof ComputerTimeoutError) &&
+				settled?.kind === "success"
+			) {
+				steps.push({
+					...detailsFromParams(single),
+					status: "success",
+					code: mapped.code,
+					message:
+						error instanceof ComputerTimeoutError
+							? "Computer input completed after its deadline. Do not retry automatically."
+							: "Computer input completed after cancellation was requested. Do not retry automatically.",
+				});
+			} else {
+				steps.push({
+					...detailsFromParams(single),
+					status: mapped.code === COMPUTER_DISABLED_CODE ? "disabled" : "error",
+					code: mapped.code,
+					message: mapped.message,
+				});
+			}
+			if (error instanceof ToolAbortError || error instanceof ComputerTimeoutError) {
+				throw new ComputerBatchGuardError(error, steps, lastScreenshot, lastScreenshotSource);
+			}
 			return {
 				steps,
 				screenshot: lastScreenshot,
@@ -765,11 +878,25 @@ async function dispatchBatchComputerActions(
 				failedStep: { code: mapped.code, message: mapped.message },
 			};
 		}
-		steps.push(stepDetails);
 	}
 	if (includeBatchScreenshot) {
-		lastScreenshotSource = await captureScreenshot(controller, deadline, signal);
-		lastScreenshot = normalizeScreenshot(lastScreenshotSource) ?? lastScreenshot;
+		try {
+			lastScreenshotSource = await captureScreenshot(controller, deadline, signal);
+			lastScreenshot = normalizeScreenshot(lastScreenshotSource) ?? lastScreenshot;
+			if (lastScreenshot)
+				await persistScreenshotFallback(lastScreenshotSource, lastScreenshot, session as ToolSession, deadline);
+		} catch {
+			return {
+				steps,
+				screenshot: lastScreenshot,
+				screenshotSource: lastScreenshotSource,
+				failedStep: {
+					code: COMPUTER_OBSERVATION_INCOMPLETE_CODE,
+					message:
+						"The computer input completed, but its requested observation is incomplete. Do not retry automatically.",
+				},
+			};
+		}
 	}
 	return { steps, screenshot: lastScreenshot, screenshotSource: lastScreenshotSource };
 }
@@ -877,13 +1004,17 @@ async function persistScreenshotFallback(
 	value: unknown,
 	screenshot: ComputerScreenshotDetails | undefined,
 	session: ToolSession,
+	deadline?: ComputerDeadline,
 ): Promise<void> {
+	assertComputerDeadline(deadline);
+
 	if (!screenshot || screenshot.path) return;
 	const image = fullResolutionImageContentFromNativeResult(value);
 	if (!image) return;
 	const dir = await getScreenshotFallbackDir(session);
 	const filePath = path.join(dir, `computer-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
 	await fs.writeFile(filePath, Buffer.from(image.data, "base64"), { mode: 0o600 });
+	assertComputerDeadline(deadline);
 	screenshot.path = filePath;
 }
 
@@ -935,8 +1066,12 @@ function formatByteCount(bytes: number): string {
 
 function mapComputerError(error: unknown, hotkey?: string): { code: string; message: string } {
 	if (error instanceof ComputerTimeoutError || (error instanceof Error && error.name === "TimeoutError"))
-		return { code: "COMPUTER_TIMEOUT", message: "Computer action timed out. Do not assume the action completed." };
-	if (error instanceof Error && error.name === "AbortError") {
+		return {
+			code: "COMPUTER_TIMEOUT",
+			message:
+				"Computer deadline expired. Expired queued work was not dispatched; dispatched input reached terminal settlement. Do not retry automatically.",
+		};
+	if (error instanceof ToolAbortError || (error instanceof Error && error.name === "AbortError")) {
 		return {
 			code: "COMPUTER_CANCELLED",
 			message: `Computer action was cancelled. Stop and wait for the user${hotkey ? ` (kill-switch hotkey: ${hotkey})` : ""}.`,
@@ -1046,6 +1181,7 @@ async function openSecureComputerAuditLog(auditPath: string, phase: "prepare" | 
 }
 
 async function prepareComputerAuditLog(session: ToolSession): Promise<void> {
+	if (computerAuditPreparationForTests) await computerAuditPreparationForTests(session);
 	const auditPath = computerAuditPath(session, "prepare");
 	if (!auditPath) return;
 	const handle = await openSecureComputerAuditLog(auditPath, "prepare");

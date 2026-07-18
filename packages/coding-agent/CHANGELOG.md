@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
-- Apple Silicon macOS computer actions in new or ambient tmux sessions now run through a private packaged pre-tmux owner, preserving Screen Recording and Accessibility/PostEvent authority across detach and reattach. The persistent local lease uses exact bounded UTF-8 framing, verified cleanup, no-late-dispatch deadlines with terminal settlement for dispatched input, redacted public errors, and fail-closed audit preparation without persisting coordinates, keys, typed text, screenshot bytes, paths, or broker credentials.
+- Apple Silicon macOS computer actions in new or ambient tmux sessions now run through a private packaged pre-tmux owner, preserving Screen Recording and Accessibility/PostEvent authority across detach and reattach. The persistent local lease uses exact bounded UTF-8 framing, verified cleanup, admission-time no-late-dispatch deadlines with terminal settlement for dispatched input, truthful non-retryable partial outcomes when screenshot follow-up fails after input, redacted public errors, and fail-closed audit preparation without persisting coordinates, keys, typed text, screenshot bytes, paths, or broker credentials.
 - Skill invocation failures now list available skill names so agents can recover from typos without a blind retry loop.
 - Workflow state receipts now use canonical session-layout paths, require resolved session identity, and report a `state_path` that matches native write/clear output (#2393).
 
